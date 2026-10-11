@@ -7,6 +7,20 @@ describe("edit preview", () => {
             .toBe("- old\n+ new");
     });
 
+    it("keeps unchanged lines interleaved among changed lines", () => {
+        expect(previewEditDiff({ edits: [{
+            oldText: "old cyan\nold magenta\nkeep B2\nold yellow",
+            newText: "new cyan\nnew magenta\nkeep B2\nnew yellow",
+        }] })).toBe("- old cyan\n- old magenta\n+ new cyan\n+ new magenta\n  keep B2\n- old yellow\n+ new yellow");
+    });
+
+    it("aligns unchanged lines after insertions and deletions", () => {
+        expect(previewEditDiff({ edits: [{
+            oldText: "remove\nkeep\nold",
+            newText: "keep\nnew\ninsert",
+        }] })).toBe("- remove\n  keep\n- old\n+ new\n+ insert");
+    });
+
     it("labels multiple disjoint replacements", () => {
         expect(previewEditDiff({ edits: [
             { oldText: "a", newText: "b" },
