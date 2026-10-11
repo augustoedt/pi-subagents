@@ -25,6 +25,7 @@ import { validateAgentGraphAcyclicity } from "./lib/agent-graph";
 import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
+import { previewEditDiff } from "./lib/tool-edit-diff";
 
 interface ToolEvent {
 	tool: string;
@@ -39,6 +40,9 @@ interface ToolEvent {
 	 * would let the second start overwrite the first.
 	 */
 	status: "running" | "done";
+	/** Bounded replacement preview; only displayed for successful edits in expanded mode. */
+	editDiff?: string;
+	editSucceeded?: boolean;
 	/**
 	 * Live progress of subagents spawned by this tool call. Populated only for
 	 * `subagent` tool calls, from the `partialResult.details.results` payload of
@@ -730,6 +734,7 @@ async function runSubagent(
 					progress.recentTools.push({
 						tool: evt.toolName,
 						args: extractToolArgsPreview((evt.args || {}) as Record<string, unknown>),
+						editDiff: evt.toolName === "edit" ? previewEditDiff((evt.args || {}) as Record<string, unknown>) : undefined,
 						toolCallId: evt.toolCallId,
 						status: "running",
 					});
@@ -789,6 +794,7 @@ async function runSubagent(
 						: undefined;
 					if (hit) {
 						hit.status = "done";
+						hit.editSucceeded = evt.toolName === "edit" && !evt.isError;
 						// Prefer the end event's final results over the last throttled
 						// update — throttling can drop the trailing update, leaving stale
 						// children visible on a tool that has actually completed.
@@ -1118,6 +1124,12 @@ function renderAgentProgress(
 
 	for (const t of toolsToShow) {
 		renderToolRow(t.tool, t.args, t.children, t.status === "running");
+		if (expanded && t.editSucceeded && t.editDiff) {
+			for (const diffLine of t.editDiff.split("\n")) {
+				const color = diffLine.startsWith("- ") ? "error" : diffLine.startsWith("+ ") ? "success" : "muted";
+				addLine(theme.fg(color, `    ${diffLine}`));
+			}
+		}
 	}
 
 	// Latest assistant message (prose "thinking"). Rendered at every depth so a

@@ -130,7 +130,7 @@ Large outputs (>`DEFAULT_MAX_BYTES`) are head-truncated before being returned to
 Two levels, toggled with `ctrl+o`:
 
 - **Collapsed (default):** the tool call shows one line — `subagent <agent> <60-char task preview>`. The result block shows the agent header (status, tool count, duration), the chronological tool log (one line per call, running calls marked with `▸`), the latest prose "thinking" line, and a usage line (tokens in/out, cache, cost, context-window gauge).
-- **Expanded:** the call header streams the full task body live as the parent writes it (like `write`/`edit`). The result block additionally renders the subagent's full final output as markdown. Nested children (when a worker spawns scout/researcher) render inline, indented under the row that dispatched them, with their own per-row context gauge.
+- **Expanded:** the call header streams the full task body live as the parent writes it (like `write`/`edit`). The result block additionally renders the subagent's full final output as markdown. Successful `edit` calls show a bounded preview of removed and added replacement lines under the file path; this is not a full repository diff (use `git diff` for that). Nested children (when a worker spawns scout/researcher) render inline, indented under the row that dispatched them, with their own per-row context gauge.
 
 ## Registering Agents from Other Extensions
 
