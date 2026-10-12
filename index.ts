@@ -10,7 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
-import { Container, Key, Markdown, Spacer, Text, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Key, Markdown, SelectList, Spacer, Text, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
 import { configureSafeBash } from "./tools/safe-bash.js";
@@ -1574,12 +1574,32 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("The latest subagent has no recorded successful edits", "info");
 				return;
 			}
-			const options = edits.map((edit, index) => `${index + 1}. ${edit.file}`);
+			let selectedIndex = 0;
 			while (true) {
-				const selected = await ctx.ui.select(`Subagent edits (${edits.length})`, options);
-				if (!selected) return;
-				const index = options.indexOf(selected);
-				if (index < 0) return;
+				const index = await ctx.ui.custom<number | undefined>((tui, theme, _kb, done) => {
+					const items = edits.map((edit, i) => ({ value: String(i), label: `${i + 1}. ${edit.file}` }));
+					const list = new SelectList(items, Math.max(3, Math.min(12, tui.terminal.rows - 6)), {
+						selectedPrefix: text => theme.fg("accent", text),
+						selectedText: text => theme.fg("accent", text),
+						description: text => theme.fg("muted", text),
+						scrollInfo: text => theme.fg("dim", text),
+						noMatch: text => theme.fg("warning", text),
+					});
+					list.setSelectedIndex(selectedIndex);
+					list.onSelect = item => done(Number(item.value));
+					list.onCancel = () => done(undefined);
+					return {
+						render(width) {
+							const title = new Text(theme.fg("accent", `Subagent edits (${edits.length})`), 0, 0).render(width);
+							const footer = new Text(theme.fg("dim", "↑↓ selecionar · Enter abrir · Esc sair"), 0, 0).render(width);
+							return [...title, "", ...list.render(width), "", ...footer];
+						},
+						handleInput(data) { list.handleInput(data); tui.requestRender(); },
+						invalidate() { list.invalidate(); },
+					};
+				});
+				if (index === undefined) return;
+				selectedIndex = index;
 				const edit = edits[index]!;
 				await ctx.ui.custom<void>((tui, theme, kb, done) => {
 					let offset = 0;
