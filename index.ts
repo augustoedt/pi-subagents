@@ -26,7 +26,7 @@ import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 import { DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER, fullEditDiff, previewEditDiff } from "./lib/tool-edit-diff";
-import { editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit } from "./lib/subagent-edits";
+import { collectAgentEdits, editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit } from "./lib/subagent-edits";
 
 interface ToolEvent {
 	tool: string;
@@ -1248,6 +1248,7 @@ async function runPipeline(
 			agent: step.agent, task: step.task, output: result.output,
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - stepStart,
+			edits: collectAgentEdits(result),
 		};
 		results.push(stepResult);
 		totalUsage = accumulateUsage(totalUsage, result.usage);
@@ -1325,6 +1326,7 @@ async function runLoop(
 			iteration: i + 1, output: result.output,
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - iterStart,
+			edits: collectAgentEdits(result),
 		};
 		totalUsage = accumulateUsage(totalUsage, result.usage);
 
@@ -1337,6 +1339,7 @@ async function runLoop(
 					runSubagent(judgeAgent, judgePrompt, cwd, signal),
 				);
 				totalUsage = accumulateUsage(totalUsage, judgeResult.usage);
+				iterResult.edits?.push(...collectAgentEdits(judgeResult));
 
 				// Parse judge verdict
 				const satisfied = parseJudgeVerdict(judgeResult.output);
@@ -1573,7 +1576,7 @@ export default function (pi: ExtensionAPI) {
 			let selectedIndex = 0;
 			while (true) {
 				const index = await ctx.ui.custom<number | undefined>((tui, theme, _kb, done) => {
-					const items = edits.map((edit, i) => ({ value: String(i), label: `${i + 1}. ${edit.file}` }));
+					const items = edits.map((edit, i) => ({ value: String(i), label: `${i + 1}. ${edit.agent} · ${edit.file}` }));
 					const list = new SelectList(items, Math.max(3, Math.min(12, tui.terminal.rows - 6)), {
 						selectedPrefix: text => theme.fg("accent", text),
 						selectedText: text => theme.fg("accent", text),
@@ -1608,7 +1611,7 @@ export default function (pi: ExtensionAPI) {
 					};
 					return {
 						render(width) {
-							const title = new Text(theme.fg("accent", `Edit ${index + 1}/${edits.length} · ${edit.file}`), 0, 0).render(width);
+							const title = new Text(theme.fg("accent", `Edit ${index + 1}/${edits.length} · ${edit.agent} · ${edit.file}`), 0, 0).render(width);
 							const warning = notice ? new Text(theme.fg("warning", notice), 0, 0).render(width) : [];
 							const diff = edit.diff.split("\n").map(line =>
 								theme.fg(line.startsWith("- ") ? "error" : line.startsWith("+ ") ? "success" : "muted", line),

@@ -25,6 +25,12 @@ export interface PipelineStep {
     connector?: string;  // Override agent's default connector for this step
 }
 
+export interface SavedEdit {
+    file: string;
+    diff: string;
+    agent: string;
+}
+
 export interface PipelineStepResult {
     agent: string;
     task: string;
@@ -32,6 +38,7 @@ export interface PipelineStepResult {
     exitCode: number;
     usage: AgentUsage;
     durationMs: number;
+    edits?: SavedEdit[];
 }
 
 export interface PipelineResult {
@@ -51,6 +58,7 @@ export interface LoopIterationResult {
     usage: AgentUsage;
     durationMs: number;
     judgeVerdict?: { satisfied: boolean; response: string };  // Present when judge is configured
+    edits?: SavedEdit[];
 }
 
 export interface LoopResult {

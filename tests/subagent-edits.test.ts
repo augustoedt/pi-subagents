@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { editPreviewNotice, latestSubagentEdits, listSubagentRuns, moveEditPreview } from "../lib/subagent-edits";
+import { collectAgentEdits, editPreviewNotice, latestSubagentEdits, listSubagentRuns, moveEditPreview } from "../lib/subagent-edits";
 
 const result = (recentTools: unknown[], toolName = "subagent") => ({
     type: "message",
@@ -15,8 +15,8 @@ describe("/se latest subagent edits", () => {
             { tool: "edit", args: "broken.txt", editSucceeded: false, editDiff: "- a\n+ b" },
         ])];
         expect(latestSubagentEdits(branch)).toEqual([
-            { file: "first.txt", diff: "- old\n+ new" },
-            { file: "second.txt", diff: "- red\n+ blue" },
+            { file: "first.txt", diff: "- old\n+ new", agent: "subagent" },
+            { file: "second.txt", diff: "- red\n+ blue", agent: "subagent" },
         ]);
     });
 
@@ -29,8 +29,8 @@ describe("/se latest subagent edits", () => {
               editDiff: "- old\n… diff preview truncated; use git diff for full changes" },
         ])];
         expect(latestSubagentEdits(branch)).toEqual([
-            { file: "new.txt", diff: "- old\n+ new\n+ last" },
-            { file: "legacy.txt", diff: "- old\n… diff preview truncated; use git diff for full changes" },
+            { file: "new.txt", diff: "- old\n+ new\n+ last", agent: "subagent" },
+            { file: "legacy.txt", diff: "- old\n… diff preview truncated; use git diff for full changes", agent: "subagent" },
         ]);
     });
 
@@ -40,9 +40,9 @@ describe("/se latest subagent edits", () => {
         expect(listSubagentRuns([{ ...first, id: "first", timestamp: "2026-10-11T10:00:00Z" },
                                  { ...second, id: "second", timestamp: "2026-10-11T11:00:00Z" }]))
             .toEqual([
-                { id: "second", agent: "subagent", timestamp: "2026-10-11T11:00:00Z", edits: [] },
-                { id: "first", agent: "subagent", timestamp: "2026-10-11T10:00:00Z",
-                  edits: [{ file: "before.txt", diff: "- a\n+ b" }] },
+                { id: "second", kind: "subagent", agent: "subagent", timestamp: "2026-10-11T11:00:00Z", edits: [] },
+                { id: "first", kind: "subagent", agent: "subagent", timestamp: "2026-10-11T10:00:00Z",
+                  edits: [{ file: "before.txt", diff: "- a\n+ b", agent: "subagent" }] },
             ]);
     });
 
@@ -50,7 +50,39 @@ describe("/se latest subagent edits", () => {
         const earlier = result([{ tool: "edit", args: "earlier.txt", editSucceeded: true, editDiff: "- a\n+ b" }]);
         expect(latestSubagentEdits([earlier, result([])])).toEqual([]);
         expect(latestSubagentEdits([earlier, result([], "pipeline")])).toEqual([
-            { file: "earlier.txt", diff: "- a\n+ b" },
+            { file: "earlier.txt", diff: "- a\n+ b", agent: "subagent" },
+        ]);
+    });
+
+    it("attributes nested edits to the actual child and preserves call order", () => {
+        const child = { agent: "worker", progress: { recentTools: [
+            { tool: "edit", args: "child.txt", editSucceeded: true, editDiff: "- a\n+ b" },
+        ] } };
+        const parent = { agent: "manager", progress: { recentTools: [
+            { tool: "subagent", children: [child] },
+            { tool: "edit", args: "parent.txt", editSucceeded: true, editDiff: "- c\n+ d" },
+        ] } };
+        expect(collectAgentEdits(parent)).toEqual([
+            { file: "child.txt", diff: "- a\n+ b", agent: "manager › worker" },
+            { file: "parent.txt", diff: "- c\n+ d", agent: "manager" },
+        ]);
+    });
+
+    it("lists saved pipeline and loop edits with agent attribution", () => {
+        const pipeline = { type: "message", id: "p", message: { role: "toolResult", toolName: "pipeline",
+            details: { pipelineResult: { steps: [
+                { agent: "scout", edits: [] },
+                { agent: "worker", edits: [{ file: "pipeline.txt", diff: "+ p", agent: "worker" }] },
+            ] } } } };
+        const loop = { type: "message", id: "l", message: { role: "toolResult", toolName: "loop",
+            details: { loopResult: { iterations: [
+                { iteration: 1, edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
+            ] } } } };
+        expect(listSubagentRuns([pipeline, loop])).toEqual([
+            { id: "l", kind: "loop", agent: "loop (1 iter.)", timestamp: undefined,
+              edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
+            { id: "p", kind: "pipeline", agent: "pipeline: scout → worker", timestamp: undefined,
+              edits: [{ file: "pipeline.txt", diff: "+ p", agent: "worker" }] },
         ]);
     });
 

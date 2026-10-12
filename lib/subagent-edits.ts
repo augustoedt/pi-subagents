@@ -1,3 +1,5 @@
+import type { SavedEdit } from "./types";
+
 export function editPreviewNotice(diff: string): string | undefined {
     if (diff.includes("… per-edit safety limit reached")) return "Limite de segurança: parte do diff desta edição não foi guardada.";
     if (diff.includes("… edit exceeds safe source size")) return "Edição grande demais: diff não capturado.";
@@ -11,29 +13,37 @@ export function moveEditPreview(offset: number, delta: number, totalLines: numbe
     return Math.max(0, Math.min(Math.max(0, totalLines - visibleLines), offset + delta));
 }
 
-export interface SubagentEdit {
-    file: string;
-    diff: string;
-}
+export type SubagentEdit = SavedEdit;
 
 export interface SubagentRun {
     id: string;
     agent: string;
+    kind: "subagent" | "pipeline" | "loop";
     timestamp?: string;
     edits: SubagentEdit[];
 }
 
-function editsFromResult(result: unknown): SubagentEdit[] {
-    const progress = (result as { progress?: { recentTools?: unknown } } | null)?.progress;
-    if (!Array.isArray(progress?.recentTools)) return [];
+type ToolCall = { tool?: string; args?: unknown; editSucceeded?: boolean; editDiff?: unknown; editFullDiff?: unknown; children?: unknown };
+
+/** Traverse a child's chronological tool calls and nested children, attributing each edit to its actual agent. */
+export function collectAgentEdits(result: unknown, parents: string[] = []): SubagentEdit[] {
+    const item = result as { agent?: string; progress?: { recentTools?: unknown } } | null;
+    const agent = [...parents, item?.agent ?? "subagent"].join(" › ");
+    const tools = item?.progress?.recentTools;
+    if (!Array.isArray(tools)) return [];
     const edits: SubagentEdit[] = [];
-    for (const tool of progress.recentTools) {
-        const call = tool as { tool?: string; args?: unknown; editSucceeded?: boolean; editDiff?: unknown; editFullDiff?: unknown } | null;
-        if (call?.tool !== "edit" || !call.editSucceeded) continue;
-        const diff = typeof call.editFullDiff === "string" && call.editFullDiff
-            ? call.editFullDiff : call.editDiff;
-        if (typeof diff === "string" && diff) {
-            edits.push({ file: typeof call.args === "string" ? call.args : "(unknown file)", diff });
+    for (const tool of tools) {
+        const call = tool as ToolCall | null;
+        if (!call) continue;
+        if (call.tool === "edit" && call.editSucceeded) {
+            const diff = typeof call.editFullDiff === "string" && call.editFullDiff
+                ? call.editFullDiff : call.editDiff;
+            if (typeof diff === "string" && diff) {
+                edits.push({ file: typeof call.args === "string" ? call.args : "(unknown file)", diff, agent });
+            }
+        }
+        if (Array.isArray(call.children)) {
+            for (const child of call.children) edits.push(...collectAgentEdits(child, [...parents, item?.agent ?? "subagent"]));
         }
     }
     return edits;
@@ -46,15 +56,26 @@ export function listSubagentRuns(branch: readonly unknown[]): SubagentRun[] {
         const entry = branch[i] as { type?: string; id?: string; timestamp?: string; message?: unknown } | null;
         if (entry?.type !== "message") continue;
         const message = entry.message as { role?: string; toolName?: string; details?: unknown } | null;
-        if (message?.role !== "toolResult" || message.toolName !== "subagent") continue;
-        const details = message.details as { results?: unknown } | undefined;
-        if (!Array.isArray(details?.results)) continue;
-        for (const result of details.results) {
-            const item = result as { agent?: string } | null;
-            runs.push({
-                id: entry.id ?? String(i), agent: item?.agent ?? "subagent",
-                timestamp: entry.timestamp, edits: editsFromResult(result),
-            });
+        if (message?.role !== "toolResult" || !["subagent", "pipeline", "loop"].includes(message.toolName ?? "")) continue;
+        const details = message.details as { results?: unknown; pipelineResult?: unknown; loopResult?: unknown } | undefined;
+        const base = { id: entry.id ?? String(i), timestamp: entry.timestamp };
+        if (message.toolName === "subagent" && Array.isArray(details?.results)) {
+            for (const result of details.results) {
+                const item = result as { agent?: string } | null;
+                runs.push({ ...base, kind: "subagent", agent: item?.agent ?? "subagent", edits: collectAgentEdits(result) });
+            }
+        } else if (message.toolName === "pipeline") {
+            const steps = (details?.pipelineResult as { steps?: unknown } | undefined)?.steps;
+            if (Array.isArray(steps)) {
+                const edits = steps.flatMap(step => Array.isArray((step as { edits?: unknown })?.edits) ? (step as { edits: SavedEdit[] }).edits : []);
+                runs.push({ ...base, kind: "pipeline", agent: `pipeline: ${steps.map(step => (step as { agent?: string })?.agent ?? "?").join(" → ")}`, edits });
+            }
+        } else if (message.toolName === "loop") {
+            const iterations = (details?.loopResult as { iterations?: unknown } | undefined)?.iterations;
+            if (Array.isArray(iterations)) {
+                const edits = iterations.flatMap(iter => Array.isArray((iter as { edits?: unknown })?.edits) ? (iter as { edits: SavedEdit[] }).edits : []);
+                runs.push({ ...base, kind: "loop", agent: `loop (${iterations.length} iter.)`, edits });
+            }
         }
     }
     return runs;
