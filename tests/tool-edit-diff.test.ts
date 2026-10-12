@@ -34,9 +34,18 @@ describe("edit preview", () => {
         expect(previewEditDiff({ edits: [{ oldText: "same", newText: "same" }] })).toBeUndefined();
     });
 
-    it("bounds large previews and points to the full diff", () => {
+    it("marks previews truncated by the line limit", () => {
+        const preview = previewEditDiff({ edits: [{
+            oldText: Array.from({ length: 120 }, (_, i) => `old ${i}`).join("\n"),
+            newText: Array.from({ length: 120 }, (_, i) => `new ${i}`).join("\n"),
+        }] });
+        expect(preview).toContain("diff preview truncated; remaining lines from this edit were not stored");
+        expect(preview!.split("\n").length).toBeLessThanOrEqual(101);
+    });
+
+    it("bounds large previews and explains that omitted lines were not stored", () => {
         const preview = previewEditDiff({ edits: [{ oldText: "x".repeat(10_000), newText: "y" }] });
-        expect(preview).toContain("diff preview truncated; use git diff");
+        expect(preview).toContain("diff preview truncated; remaining lines from this edit were not stored");
         expect(preview!.length).toBeLessThan(8_100);
     });
 });

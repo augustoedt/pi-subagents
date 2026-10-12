@@ -1,6 +1,8 @@
 /** Bounded, display-only preview of edit tool replacements (not a repository diff). */
 const MAX_DIFF_CHARS = 8_000;
 const MAX_DIFF_LINES = 100;
+export const DIFF_TRUNCATED_MARKER = "… diff preview truncated; remaining lines from this edit were not stored";
+export const LARGE_EDIT_MARKER = "… large edit: replacement preview without line alignment";
 
 type Replacement = { oldText: string; newText: string };
 
@@ -21,7 +23,7 @@ function replacementDiff({ oldText, newText }: Replacement): string[] {
     }
     // Bound the alignment work; large edits are still shown as replacements.
     if (before.length > 200 || after.length > 200) {
-        return ["… large edit: replacement preview (use git diff for exact alignment)",
+        return [LARGE_EDIT_MARKER,
             ...before.map(line => `- ${line}`), ...after.map(line => `+ ${line}`)];
     }
     const lengths = Array.from({ length: before.length + 1 }, () => new Uint16Array(after.length + 1));
@@ -61,7 +63,7 @@ export function previewEditDiff(args: Record<string, unknown>): string | undefin
         const chunk = edits.length > 1 ? [`@@ edit ${i + 1} @@`, ...changed] : changed;
         for (const line of chunk) {
             if (lines.length >= MAX_DIFF_LINES || chars + line.length > MAX_DIFF_CHARS) {
-                lines.push("… diff preview truncated; use git diff for full changes");
+                lines.push(DIFF_TRUNCATED_MARKER);
                 return lines.join("\n");
             }
             lines.push(line);

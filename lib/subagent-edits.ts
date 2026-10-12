@@ -1,3 +1,13 @@
+export function editPreviewNotice(diff: string): string | undefined {
+    if (diff.includes("… diff preview truncated")) return "Prévia incompleta: o restante desta edição não foi guardado.";
+    if (diff.includes("… large edit:")) return "Alinhamento de linhas indisponível para esta edição grande.";
+    return undefined;
+}
+
+export function moveEditPreview(offset: number, delta: number, totalLines: number, visibleLines: number): number {
+    return Math.max(0, Math.min(Math.max(0, totalLines - visibleLines), offset + delta));
+}
+
 export interface SubagentEdit {
     file: string;
     diff: string;

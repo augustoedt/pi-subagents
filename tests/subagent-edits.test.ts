@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { latestSubagentEdits } from "../lib/subagent-edits";
+import { editPreviewNotice, latestSubagentEdits, moveEditPreview } from "../lib/subagent-edits";
 
 const result = (recentTools: unknown[], toolName = "subagent") => ({
     type: "message",
@@ -32,5 +32,23 @@ describe("/se latest subagent edits", () => {
         expect(latestSubagentEdits([])).toEqual([]);
         expect(latestSubagentEdits([{ type: "message", message: { role: "toolResult", toolName: "subagent" } }])).toEqual([]);
         expect(latestSubagentEdits([result([{ tool: "edit", args: "missing.txt", editSucceeded: true }])])).toEqual([]);
+    });
+
+    it("warns for current and previously saved truncated previews", () => {
+        expect(editPreviewNotice("- old\n… diff preview truncated; remaining lines from this edit were not stored"))
+            .toContain("Prévia incompleta");
+        expect(editPreviewNotice("… diff preview truncated; use git diff for full changes"))
+            .toContain("Prévia incompleta");
+        expect(editPreviewNotice("… large edit: replacement preview without line alignment"))
+            .toContain("Alinhamento");
+        expect(editPreviewNotice("- old\n+ new")).toBeUndefined();
+    });
+
+    it("clamps line and page navigation at both ends, including short previews", () => {
+        expect(moveEditPreview(0, -12, 80, 12)).toBe(0);
+        expect(moveEditPreview(0, 12, 80, 12)).toBe(12);
+        expect(moveEditPreview(60, 12, 80, 12)).toBe(68);
+        expect(moveEditPreview(68, 1, 80, 12)).toBe(68);
+        expect(moveEditPreview(0, 12, 4, 12)).toBe(0);
     });
 });

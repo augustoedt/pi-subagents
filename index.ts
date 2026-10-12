@@ -10,7 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Key, Markdown, Spacer, Text, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
 import { configureSafeBash } from "./tools/safe-bash.js";
@@ -26,7 +26,7 @@ import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 import { previewEditDiff } from "./lib/tool-edit-diff";
-import { latestSubagentEdits } from "./lib/subagent-edits";
+import { editPreviewNotice, latestSubagentEdits, moveEditPreview } from "./lib/subagent-edits";
 
 interface ToolEvent {
 	tool: string;
@@ -1570,22 +1570,33 @@ export default function (pi: ExtensionAPI) {
 				const edit = edits[index]!;
 				await ctx.ui.custom<void>((tui, theme, kb, done) => {
 					let offset = 0;
+					let totalLines = 0;
+					let visibleLines = 12;
+					const notice = editPreviewNotice(edit.diff);
+					const scroll = (delta: number) => {
+						const next = moveEditPreview(offset, delta, totalLines, visibleLines);
+						if (next !== offset) { offset = next; tui.requestRender(); }
+					};
 					return {
 						render(width) {
 							const title = new Text(theme.fg("accent", `Edit ${index + 1}/${edits.length} · ${edit.file}`), 0, 0).render(width);
+							const warning = notice ? new Text(theme.fg("warning", notice), 0, 0).render(width) : [];
 							const diff = edit.diff.split("\n").map(line =>
 								theme.fg(line.startsWith("- ") ? "error" : line.startsWith("+ ") ? "success" : "muted", line),
 							).join("\n");
 							const lines = new Text(diff, 0, 0).render(width);
-							const visible = 12;
-							offset = Math.min(offset, Math.max(0, lines.length - visible));
-							const footer = new Text(theme.fg("dim", `↑↓ scroll · Esc back · ${Math.min(offset + 1, lines.length)}–${Math.min(offset + visible, lines.length)}/${lines.length}`), 0, 0).render(width);
-							return [...title, "", ...lines.slice(offset, offset + visible), "", ...footer];
+							totalLines = lines.length;
+							visibleLines = Math.max(3, Math.min(12, tui.terminal.rows - title.length - warning.length - 6));
+							offset = moveEditPreview(offset, 0, totalLines, visibleLines);
+							const footer = new Text(theme.fg("dim", `↑↓ linha · Shift+↑/↓ página · Esc voltar · ${Math.min(offset + 1, totalLines)}–${Math.min(offset + visibleLines, totalLines)}/${totalLines}`), 0, 0).render(width);
+							return [...title, ...warning, "", ...lines.slice(offset, offset + visibleLines), "", ...footer];
 						},
 						handleInput(data) {
 							if (kb.matches(data, "tui.select.cancel")) done(undefined);
-							else if (kb.matches(data, "tui.select.up")) { offset = Math.max(0, offset - 1); tui.requestRender(); }
-							else if (kb.matches(data, "tui.select.down")) { offset++; tui.requestRender(); }
+							else if (matchesKey(data, Key.shift("up")) || kb.matches(data, "tui.select.pageUp")) scroll(-visibleLines);
+							else if (matchesKey(data, Key.shift("down")) || kb.matches(data, "tui.select.pageDown")) scroll(visibleLines);
+							else if (kb.matches(data, "tui.select.up")) scroll(-1);
+							else if (kb.matches(data, "tui.select.down")) scroll(1);
 						},
 					};
 				});
