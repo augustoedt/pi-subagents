@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { editPreviewNotice, latestSubagentEdits, moveEditPreview } from "../lib/subagent-edits";
+import { editPreviewNotice, latestSubagentEdits, listSubagentRuns, moveEditPreview } from "../lib/subagent-edits";
 
 const result = (recentTools: unknown[], toolName = "subagent") => ({
     type: "message",
@@ -32,6 +32,18 @@ describe("/se latest subagent edits", () => {
             { file: "new.txt", diff: "- old\n+ new\n+ last" },
             { file: "legacy.txt", diff: "- old\n… diff preview truncated; use git diff for full changes" },
         ]);
+    });
+
+    it("lists prior direct runs newest first, including runs without edits", () => {
+        const first = result([{ tool: "edit", args: "before.txt", editSucceeded: true, editDiff: "- a\n+ b" }]);
+        const second = result([]);
+        expect(listSubagentRuns([{ ...first, id: "first", timestamp: "2026-10-11T10:00:00Z" },
+                                 { ...second, id: "second", timestamp: "2026-10-11T11:00:00Z" }]))
+            .toEqual([
+                { id: "second", agent: "subagent", timestamp: "2026-10-11T11:00:00Z", edits: [] },
+                { id: "first", agent: "subagent", timestamp: "2026-10-11T10:00:00Z",
+                  edits: [{ file: "before.txt", diff: "- a\n+ b" }] },
+            ]);
     });
 
     it("uses the latest subagent, even when it has no edits", () => {

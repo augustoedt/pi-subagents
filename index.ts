@@ -26,7 +26,7 @@ import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 import { DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER, fullEditDiff, previewEditDiff } from "./lib/tool-edit-diff";
-import { editPreviewNotice, latestSubagentEdits, moveEditPreview } from "./lib/subagent-edits";
+import { editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit } from "./lib/subagent-edits";
 
 interface ToolEvent {
 	tool: string;
@@ -1563,17 +1563,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("se", {
-		description: "Explorar as edições do último subagente",
+		description: "Explorar as edições dos subagentes desta sessão",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/se requires interactive mode", "error");
 				return;
 			}
-			const edits = latestSubagentEdits(ctx.sessionManager.getBranch());
-			if (!edits.length) {
-				ctx.ui.notify("The latest subagent has no recorded successful edits", "info");
-				return;
-			}
+			const browseRun = async (edits: SubagentEdit[]) => {
 			let selectedIndex = 0;
 			while (true) {
 				const index = await ctx.ui.custom<number | undefined>((tui, theme, _kb, done) => {
@@ -1633,6 +1629,23 @@ export default function (pi: ExtensionAPI) {
 						},
 					};
 				});
+			}
+			};
+			const runs = listSubagentRuns(ctx.sessionManager.getBranch());
+			if (!runs.length) { ctx.ui.notify("No subagent results on this branch", "info"); return; }
+			while (true) {
+				const choices = runs.map((run, i) => `${i + 1}. ${run.agent} · ${run.edits.length} edit(s)${run.timestamp ? ` · ${new Date(run.timestamp).toLocaleString("pt-BR")}` : ""}`);
+				const selected = runs.length === 1 ? choices[0] : await ctx.ui.select("Subagent runs (latest first)", choices);
+				if (!selected) return;
+				const run = runs[choices.indexOf(selected)];
+				if (!run) return;
+				if (!run.edits.length) {
+					ctx.ui.notify("This subagent has no recorded successful edits", "info");
+					if (runs.length === 1) return;
+					continue;
+				}
+				await browseRun(run.edits);
+				if (runs.length === 1) return;
 			}
 		},
 	});
