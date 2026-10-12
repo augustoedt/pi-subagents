@@ -39,7 +39,7 @@ describe("/se latest subagent edits", () => {
         const second = result([]);
         expect(listSubagentRuns([{ ...first, id: "first", timestamp: "2026-10-11T10:00:00Z" },
                                  { ...second, id: "second", timestamp: "2026-10-11T11:00:00Z" }]))
-            .toEqual([
+            .toMatchObject([
                 { id: "second", kind: "subagent", agent: "subagent", timestamp: "2026-10-11T11:00:00Z", edits: [] },
                 { id: "first", kind: "subagent", agent: "subagent", timestamp: "2026-10-11T10:00:00Z",
                   edits: [{ file: "before.txt", diff: "- a\n+ b", agent: "subagent" }] },
@@ -78,12 +78,43 @@ describe("/se latest subagent edits", () => {
             details: { loopResult: { iterations: [
                 { iteration: 1, edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
             ] } } } };
-        expect(listSubagentRuns([pipeline, loop])).toEqual([
+        expect(listSubagentRuns([pipeline, loop])).toMatchObject([
             { id: "l", kind: "loop", agent: "loop (1 iter.)", timestamp: undefined,
               edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
             { id: "p", kind: "pipeline", agent: "pipeline: scout → worker", timestamp: undefined,
               edits: [{ file: "pipeline.txt", diff: "+ p", agent: "worker" }] },
         ]);
+    });
+
+    it("restores archived edits before the recent log and flags failures and omissions", () => {
+        const entry = { type: "message", id: "failed", message: { role: "toolResult", toolName: "subagent",
+            details: { results: [{ agent: "worker", exitCode: 1, progress: {
+                status: "failed", toolCount: 60, archivedEdits: [
+                    { file: "old.txt", diff: "- old\n+ middle", agent: "worker" },
+                ], recentTools: [
+                    { tool: "edit", args: "new.txt", editSucceeded: true, editFullDiff: "- middle\n+ final" },
+                    { tool: "edit", args: "failed.txt", editSucceeded: false, editDiff: "- a\n+ b" },
+                ], omittedEdits: 3, failedEdits: 1,
+            } }] } } };
+        expect(listSubagentRuns([entry])).toMatchObject([{ status: "failed", omittedEdits: 3,
+            failedEdits: 1, historyIncomplete: false, edits: [
+                { file: "old.txt", diff: "- old\n+ middle", agent: "worker" },
+                { file: "new.txt", diff: "- middle\n+ final", agent: "worker" },
+            ] }]);
+    });
+
+    it("warns that older sessions may lack evicted edit history", () => {
+        const entry = { type: "message", message: { role: "toolResult", toolName: "subagent",
+            details: { results: [{ agent: "worker", progress: { toolCount: 55, recentTools: [] } }] } } };
+        expect(listSubagentRuns([entry])).toMatchObject([{ historyIncomplete: true, edits: [] }]);
+    });
+
+    it("flags old pipeline/loop results that lack saved edits", () => {
+        const pipeline = { type: "message", message: { role: "toolResult", toolName: "pipeline",
+            details: { pipelineResult: { steps: [{ agent: "worker" }] } } } };
+        const loop = { type: "message", message: { role: "toolResult", toolName: "loop",
+            details: { loopResult: { iterations: [{ iteration: 1 }] } } } };
+        expect(listSubagentRuns([pipeline, loop]).map(run => run.historyIncomplete)).toEqual([true, true]);
     });
 
     it("ignores malformed or absent results", () => {

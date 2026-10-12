@@ -39,6 +39,9 @@ export interface PipelineStepResult {
     usage: AgentUsage;
     durationMs: number;
     edits?: SavedEdit[];
+    omittedEdits?: number;
+    failedEdits?: number;
+    historyIncomplete?: boolean;
 }
 
 export interface PipelineResult {
@@ -59,6 +62,9 @@ export interface LoopIterationResult {
     durationMs: number;
     judgeVerdict?: { satisfied: boolean; response: string };  // Present when judge is configured
     edits?: SavedEdit[];
+    omittedEdits?: number;
+    failedEdits?: number;
+    historyIncomplete?: boolean;
 }
 
 export interface LoopResult {

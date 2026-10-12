@@ -21,17 +21,22 @@ export interface SubagentRun {
     kind: "subagent" | "pipeline" | "loop";
     timestamp?: string;
     edits: SubagentEdit[];
+    status: "completed" | "failed";
+    omittedEdits: number;
+    failedEdits: number;
+    historyIncomplete: boolean;
 }
 
 type ToolCall = { tool?: string; args?: unknown; editSucceeded?: boolean; editDiff?: unknown; editFullDiff?: unknown; children?: unknown };
 
 /** Traverse a child's chronological tool calls and nested children, attributing each edit to its actual agent. */
 export function collectAgentEdits(result: unknown, parents: string[] = []): SubagentEdit[] {
-    const item = result as { agent?: string; progress?: { recentTools?: unknown } } | null;
+    const item = result as { agent?: string; progress?: { recentTools?: unknown; archivedEdits?: unknown } } | null;
     const agent = [...parents, item?.agent ?? "subagent"].join(" › ");
+    const archived = item?.progress?.archivedEdits;
+    const edits: SubagentEdit[] = Array.isArray(archived) ? [...archived] : [];
     const tools = item?.progress?.recentTools;
-    if (!Array.isArray(tools)) return [];
-    const edits: SubagentEdit[] = [];
+    if (!Array.isArray(tools)) return edits;
     for (const tool of tools) {
         const call = tool as ToolCall | null;
         if (!call) continue;
@@ -49,6 +54,27 @@ export function collectAgentEdits(result: unknown, parents: string[] = []): Suba
     return edits;
 }
 
+export function collectAgentHealth(result: unknown): { omittedEdits: number; failedEdits: number; historyIncomplete: boolean } {
+    const progress = (result as { progress?: { recentTools?: unknown; archivedEdits?: unknown; omittedEdits?: number; failedEdits?: number; historyIncomplete?: boolean; toolCount?: number } } | null)?.progress;
+    const tools = Array.isArray(progress?.recentTools) ? progress.recentTools : [];
+    const health = {
+        omittedEdits: progress?.omittedEdits ?? 0,
+        failedEdits: progress?.failedEdits ?? 0,
+        historyIncomplete: !!progress?.historyIncomplete || (!Array.isArray(progress?.archivedEdits) && (progress?.toolCount ?? 0) > tools.length),
+    };
+    for (const tool of tools) {
+        const children = (tool as ToolCall | null)?.children;
+        if (!Array.isArray(children)) continue;
+        for (const child of children) {
+            const nested = collectAgentHealth(child);
+            health.omittedEdits += nested.omittedEdits;
+            health.failedEdits += nested.failedEdits;
+            health.historyIncomplete ||= nested.historyIncomplete;
+        }
+    }
+    return health;
+}
+
 /** Latest first, on the active session branch only; never read other branches or sessions. */
 export function listSubagentRuns(branch: readonly unknown[]): SubagentRun[] {
     const runs: SubagentRun[] = [];
@@ -61,20 +87,32 @@ export function listSubagentRuns(branch: readonly unknown[]): SubagentRun[] {
         const base = { id: entry.id ?? String(i), timestamp: entry.timestamp };
         if (message.toolName === "subagent" && Array.isArray(details?.results)) {
             for (const result of details.results) {
-                const item = result as { agent?: string } | null;
-                runs.push({ ...base, kind: "subagent", agent: item?.agent ?? "subagent", edits: collectAgentEdits(result) });
+                const item = result as { agent?: string; progress?: { status?: string }; exitCode?: number } | null;
+                runs.push({ ...base, kind: "subagent", agent: item?.agent ?? "subagent", edits: collectAgentEdits(result),
+                    status: item?.progress?.status === "failed" || (item?.exitCode ?? 0) !== 0 ? "failed" : "completed",
+                    ...collectAgentHealth(result) });
             }
         } else if (message.toolName === "pipeline") {
-            const steps = (details?.pipelineResult as { steps?: unknown } | undefined)?.steps;
+            const pipeline = details?.pipelineResult as { steps?: unknown; error?: string; stoppedAt?: number } | undefined;
+            const steps = pipeline?.steps;
             if (Array.isArray(steps)) {
                 const edits = steps.flatMap(step => Array.isArray((step as { edits?: unknown })?.edits) ? (step as { edits: SavedEdit[] }).edits : []);
-                runs.push({ ...base, kind: "pipeline", agent: `pipeline: ${steps.map(step => (step as { agent?: string })?.agent ?? "?").join(" → ")}`, edits });
+                runs.push({ ...base, kind: "pipeline", agent: `pipeline: ${steps.map(step => (step as { agent?: string })?.agent ?? "?").join(" → ")}`, edits,
+                    status: pipeline?.error || pipeline?.stoppedAt !== undefined ? "failed" : "completed",
+                    omittedEdits: steps.reduce((n, s) => n + ((s as { omittedEdits?: number }).omittedEdits ?? 0), 0),
+                    failedEdits: steps.reduce((n, s) => n + ((s as { failedEdits?: number }).failedEdits ?? 0), 0),
+                    historyIncomplete: steps.some(s => (s as { historyIncomplete?: boolean }).historyIncomplete || !Array.isArray((s as { edits?: unknown }).edits)) });
             }
         } else if (message.toolName === "loop") {
-            const iterations = (details?.loopResult as { iterations?: unknown } | undefined)?.iterations;
+            const loop = details?.loopResult as { iterations?: unknown; stoppedBecause?: string } | undefined;
+            const iterations = loop?.iterations;
             if (Array.isArray(iterations)) {
                 const edits = iterations.flatMap(iter => Array.isArray((iter as { edits?: unknown })?.edits) ? (iter as { edits: SavedEdit[] }).edits : []);
-                runs.push({ ...base, kind: "loop", agent: `loop (${iterations.length} iter.)`, edits });
+                runs.push({ ...base, kind: "loop", agent: `loop (${iterations.length} iter.)`, edits,
+                    status: loop?.stoppedBecause === "error" ? "failed" : "completed",
+                    omittedEdits: iterations.reduce((n, s) => n + ((s as { omittedEdits?: number }).omittedEdits ?? 0), 0),
+                    failedEdits: iterations.reduce((n, s) => n + ((s as { failedEdits?: number }).failedEdits ?? 0), 0),
+                    historyIncomplete: iterations.some(s => (s as { historyIncomplete?: boolean }).historyIncomplete || !Array.isArray((s as { edits?: unknown }).edits)) });
             }
         }
     }

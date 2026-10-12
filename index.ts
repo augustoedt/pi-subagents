@@ -26,7 +26,8 @@ import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 import { DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER, fullEditDiff, previewEditDiff } from "./lib/tool-edit-diff";
-import { collectAgentEdits, editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit } from "./lib/subagent-edits";
+import { collectAgentEdits, collectAgentHealth, editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit } from "./lib/subagent-edits";
+import { EditArchive } from "./lib/edit-archive";
 
 interface ToolEvent {
 	tool: string;
@@ -65,6 +66,11 @@ interface AgentProgress {
 	 * renderer prefixes running entries with `▸` and done ones with `  `.
 	 */
 	recentTools: ToolEvent[];
+	/** Older successful edits removed from recentTools; [] marks a result captured by the new archive. */
+	archivedEdits?: SubagentEdit[];
+	omittedEdits?: number;
+	failedEdits?: number;
+	historyIncomplete?: boolean;
 	toolCount: number;
 	tokens: number;
 	durationMs: number;
@@ -646,10 +652,18 @@ async function runSubagent(
 
 	const MAX_ATTEMPTS = 2; // 1 initial attempt + 1 retry
 	const MAX_PARTIAL_CONTEXT = 4000;
+	const retainedEdits = new EditArchive();
+	let priorFailedEdits = 0;
+	let priorHistoryIncomplete = false;
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		const isRetry = attempt > 1;
 		const fullDiffs = new Map<string, string>();
+		const archive = new EditArchive();
+		let failedEdits = 0;
+		let evictedChildOmissions = 0;
+		let evictedChildFailures = 0;
+		let evictedHistoryIncomplete = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn(command, spawnArgs, {
@@ -754,6 +768,14 @@ async function runSubagent(
 						const idx = progress.recentTools.findIndex((t) => t.status !== "running");
 						if (idx === -1) break; // only running entries left — don't evict in-flight
 						const removed = progress.recentTools.splice(idx, 1)[0];
+						if (removed?.editSucceeded && removed.toolCallId) removed.editFullDiff = fullDiffs.get(removed.toolCallId);
+						if (removed) archive.addAll(collectAgentEdits({ agent: agent.name, progress: { recentTools: [removed] } }));
+						if (removed?.children?.length) {
+							const nested = collectAgentHealth({ progress: { recentTools: [removed], archivedEdits: [] } });
+							evictedChildOmissions += nested.omittedEdits;
+							evictedChildFailures += nested.failedEdits;
+							evictedHistoryIncomplete ||= nested.historyIncomplete;
+						}
 						if (removed?.toolCallId) fullDiffs.delete(removed.toolCallId);
 					}
 					// ── Cycle detection (parent-side, context-free) ──
@@ -799,6 +821,7 @@ async function runSubagent(
 				}
 
 				if (evt.type === "tool_execution_end") {
+					if (evt.toolName === "edit" && evt.isError) failedEdits++;
 					const hit = evt.toolCallId
 						? progress.recentTools.find((t) => t.toolCallId === evt.toolCallId)
 						: undefined;
@@ -946,6 +969,12 @@ async function runSubagent(
 		const isLoopError = progress.error?.startsWith(LOOP_ERROR_PREFIX);
 
 		if (isLoopError && attempt < MAX_ATTEMPTS) {
+			retainedEdits.addAll(archive.entries());
+			retainedEdits.addAll(collectAgentEdits({ agent: agent.name, progress: { recentTools: progress.recentTools.map(call =>
+				call.editSucceeded && call.toolCallId ? { ...call, editFullDiff: fullDiffs.get(call.toolCallId) } : call) } }));
+			retainedEdits.recordOmissions(archive.omitted + evictedChildOmissions);
+			priorFailedEdits += failedEdits + evictedChildFailures;
+			priorHistoryIncomplete ||= evictedHistoryIncomplete;
 			// Note: result.output is overwritten (we want the best attempt's output),
 			// but result.usage accumulates (we want total cost across all attempts).
 			// Build retry task with partial context from the failed attempt
@@ -971,6 +1000,12 @@ async function runSubagent(
 		for (const call of progress.recentTools) {
 			if (call.editSucceeded && call.toolCallId) call.editFullDiff = fullDiffs.get(call.toolCallId);
 		}
+		retainedEdits.addAll(archive.entries());
+		retainedEdits.recordOmissions(archive.omitted + evictedChildOmissions);
+		progress.archivedEdits = retainedEdits.entries();
+		progress.omittedEdits = retainedEdits.omitted;
+		progress.failedEdits = priorFailedEdits + failedEdits + evictedChildFailures;
+		progress.historyIncomplete = priorHistoryIncomplete || evictedHistoryIncomplete;
 		// Success or non-loop failure — return result
 		return result;
 	}
@@ -1249,6 +1284,7 @@ async function runPipeline(
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - stepStart,
 			edits: collectAgentEdits(result),
+			...collectAgentHealth(result),
 		};
 		results.push(stepResult);
 		totalUsage = accumulateUsage(totalUsage, result.usage);
@@ -1327,6 +1363,7 @@ async function runLoop(
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - iterStart,
 			edits: collectAgentEdits(result),
+			...collectAgentHealth(result),
 		};
 		totalUsage = accumulateUsage(totalUsage, result.usage);
 
@@ -1340,6 +1377,10 @@ async function runLoop(
 				);
 				totalUsage = accumulateUsage(totalUsage, judgeResult.usage);
 				iterResult.edits?.push(...collectAgentEdits(judgeResult));
+				const judgeHealth = collectAgentHealth(judgeResult);
+				iterResult.omittedEdits = (iterResult.omittedEdits ?? 0) + judgeHealth.omittedEdits;
+				iterResult.failedEdits = (iterResult.failedEdits ?? 0) + judgeHealth.failedEdits;
+				iterResult.historyIncomplete ||= judgeHealth.historyIncomplete;
 
 				// Parse judge verdict
 				const satisfied = parseJudgeVerdict(judgeResult.output);
@@ -1637,13 +1678,19 @@ export default function (pi: ExtensionAPI) {
 			const runs = listSubagentRuns(ctx.sessionManager.getBranch());
 			if (!runs.length) { ctx.ui.notify("No subagent results on this branch", "info"); return; }
 			while (true) {
-				const choices = runs.map((run, i) => `${i + 1}. ${run.agent} · ${run.edits.length} edit(s)${run.timestamp ? ` · ${new Date(run.timestamp).toLocaleString("pt-BR")}` : ""}`);
+				const choices = runs.map((run, i) => `${i + 1}. ${run.agent} · ${run.edits.length} edit(s)${run.status === "failed" ? " · failed" : ""}${run.omittedEdits ? ` · ${run.omittedEdits} omitted` : ""}${run.historyIncomplete ? " · older history uncertain" : ""}${run.timestamp ? ` · ${new Date(run.timestamp).toLocaleString("pt-BR")}` : ""}`);
 				const selected = runs.length === 1 ? choices[0] : await ctx.ui.select("Subagent runs (latest first)", choices);
 				if (!selected) return;
 				const run = runs[choices.indexOf(selected)];
 				if (!run) return;
+				const warnings = [
+					run.omittedEdits ? `${run.omittedEdits} older edit(s) omitted by the safety limit.` : "",
+					run.historyIncomplete ? "Old result: edits outside its saved tool log may be missing." : "",
+					run.failedEdits ? `${run.failedEdits} edit call(s) failed; only successful edits are shown.` : "",
+				].filter(Boolean);
+				if (warnings.length) ctx.ui.notify(warnings.join(" "), "warning");
 				if (!run.edits.length) {
-					ctx.ui.notify("This subagent has no recorded successful edits", "info");
+					ctx.ui.notify(run.status === "failed" ? "Failed run: no successful edits were saved" : "This run has no recorded successful edits", "info");
 					if (runs.length === 1) return;
 					continue;
 				}
