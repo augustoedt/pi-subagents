@@ -26,7 +26,7 @@ import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 import { DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER, fullEditDiff, previewEditDiff } from "./lib/tool-edit-diff";
-import { collectAgentEdits, collectAgentHealth, editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit } from "./lib/subagent-edits";
+import { collectAgentEdits, collectAgentHealth, editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit, type SubagentRun } from "./lib/subagent-edits";
 import { EditArchive } from "./lib/edit-archive";
 
 interface ToolEvent {
@@ -1607,7 +1607,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("se", {
-		description: "Explorar as edições dos subagentes desta sessão",
+		description: "Explorar resultados e edições recentes dos subagentes",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/se requires interactive mode", "error");
@@ -1675,6 +1675,39 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			};
+			const browseOutput = async (run: SubagentRun) => {
+				await ctx.ui.custom<void>((tui, theme, kb, done) => {
+					let offset = 0;
+					let totalLines = 0;
+					let visibleLines = 12;
+					const limit = 128_000;
+					const clipped = run.output.length > limit;
+					const output = (run.output || "(nenhum resultado textual salvo)").slice(0, limit);
+					const scroll = (delta: number) => {
+						const next = moveEditPreview(offset, delta, totalLines, visibleLines);
+						if (next !== offset) { offset = next; tui.requestRender(); }
+					};
+					return {
+						render(width) {
+							const title = new Text(theme.fg("accent", `Resultado · ${run.agent}`), 0, 0).render(width);
+							const warning = clipped ? new Text(theme.fg("warning", "Resultado extenso: exibindo apenas o início."), 0, 0).render(width) : [];
+							const lines = new Text(output, 0, 0).render(width);
+							totalLines = lines.length;
+							visibleLines = Math.max(3, Math.min(12, tui.terminal.rows - title.length - warning.length - 6));
+							offset = moveEditPreview(offset, 0, totalLines, visibleLines);
+							const footer = new Text(theme.fg("dim", `↑↓ linha · Shift+↑/↓ página · Esc voltar · ${Math.min(offset + 1, totalLines)}–${Math.min(offset + visibleLines, totalLines)}/${totalLines}`), 0, 0).render(width);
+							return [...title, ...warning, "", ...lines.slice(offset, offset + visibleLines), "", ...footer];
+						},
+						handleInput(data) {
+							if (kb.matches(data, "tui.select.cancel")) done(undefined);
+							else if (matchesKey(data, Key.shift("up")) || kb.matches(data, "tui.select.pageUp")) scroll(-visibleLines);
+							else if (matchesKey(data, Key.shift("down")) || kb.matches(data, "tui.select.pageDown")) scroll(visibleLines);
+							else if (kb.matches(data, "tui.select.up")) scroll(-1);
+							else if (kb.matches(data, "tui.select.down")) scroll(1);
+						},
+					};
+				});
+			};
 			const runs = listSubagentRuns(ctx.sessionManager.getBranch());
 			if (!runs.length) { ctx.ui.notify("No subagent results on this branch", "info"); return; }
 			while (true) {
@@ -1690,11 +1723,15 @@ export default function (pi: ExtensionAPI) {
 				].filter(Boolean);
 				if (warnings.length) ctx.ui.notify(warnings.join(" "), "warning");
 				if (!run.edits.length) {
-					ctx.ui.notify(run.status === "failed" ? "Failed run: no successful edits were saved" : "This run has no recorded successful edits", "info");
-					if (runs.length === 1) return;
-					continue;
+					await browseOutput(run);
+				} else {
+					while (true) {
+						const action = await ctx.ui.select(run.agent, ["Resultado textual", `Edições (${run.edits.length})`]);
+						if (!action) break;
+						if (action === "Resultado textual") await browseOutput(run);
+						else await browseRun(run.edits);
+					}
 				}
-				await browseRun(run.edits);
 				if (runs.length === 1) return;
 			}
 		},

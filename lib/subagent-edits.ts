@@ -15,12 +15,15 @@ export function moveEditPreview(offset: number, delta: number, totalLines: numbe
 
 export type SubagentEdit = SavedEdit;
 
+export const MAX_SUBAGENT_RUNS = 10;
+
 export interface SubagentRun {
     id: string;
     agent: string;
     kind: "subagent" | "pipeline" | "loop";
     timestamp?: string;
     edits: SubagentEdit[];
+    output: string;
     status: "completed" | "failed";
     omittedEdits: number;
     failedEdits: number;
@@ -75,10 +78,14 @@ export function collectAgentHealth(result: unknown): { omittedEdits: number; fai
     return health;
 }
 
-/** Latest first, on the active session branch only; never read other branches or sessions. */
+function savedOutput(value: unknown): string {
+    return typeof value === "string" ? value : "";
+}
+
+/** Latest ten executions, including read-only agents; only the active session branch is scanned. */
 export function listSubagentRuns(branch: readonly unknown[]): SubagentRun[] {
     const runs: SubagentRun[] = [];
-    for (let i = branch.length - 1; i >= 0; i--) {
+    for (let i = branch.length - 1; i >= 0 && runs.length < MAX_SUBAGENT_RUNS; i--) {
         const entry = branch[i] as { type?: string; id?: string; timestamp?: string; message?: unknown } | null;
         if (entry?.type !== "message") continue;
         const message = entry.message as { role?: string; toolName?: string; details?: unknown } | null;
@@ -87,28 +94,40 @@ export function listSubagentRuns(branch: readonly unknown[]): SubagentRun[] {
         const base = { id: entry.id ?? String(i), timestamp: entry.timestamp };
         if (message.toolName === "subagent" && Array.isArray(details?.results)) {
             for (const result of details.results) {
-                const item = result as { agent?: string; progress?: { status?: string }; exitCode?: number } | null;
+                if (runs.length >= MAX_SUBAGENT_RUNS) break;
+                const item = result as { agent?: string; output?: unknown; progress?: { status?: string; error?: unknown }; exitCode?: number } | null;
                 runs.push({ ...base, kind: "subagent", agent: item?.agent ?? "subagent", edits: collectAgentEdits(result),
+                    output: savedOutput(item?.output) || savedOutput(item?.progress?.error),
                     status: item?.progress?.status === "failed" || (item?.exitCode ?? 0) !== 0 ? "failed" : "completed",
                     ...collectAgentHealth(result) });
             }
         } else if (message.toolName === "pipeline") {
-            const pipeline = details?.pipelineResult as { steps?: unknown; error?: string; stoppedAt?: number } | undefined;
+            const pipeline = details?.pipelineResult as { steps?: unknown; error?: string; stoppedAt?: number; finalOutput?: unknown } | undefined;
             const steps = pipeline?.steps;
             if (Array.isArray(steps)) {
                 const edits = steps.flatMap(step => Array.isArray((step as { edits?: unknown })?.edits) ? (step as { edits: SavedEdit[] }).edits : []);
+                const output = steps.map((step, index) => {
+                    const item = step as { agent?: string; output?: unknown } | null;
+                    return `${index + 1}. ${item?.agent ?? "?"}\n${savedOutput(item?.output) || "(sem resultado textual)"}`;
+                }).join("\n\n");
                 runs.push({ ...base, kind: "pipeline", agent: `pipeline: ${steps.map(step => (step as { agent?: string })?.agent ?? "?").join(" → ")}`, edits,
+                    output: output || savedOutput(pipeline?.finalOutput) || savedOutput(pipeline?.error),
                     status: pipeline?.error || pipeline?.stoppedAt !== undefined ? "failed" : "completed",
                     omittedEdits: steps.reduce((n, s) => n + ((s as { omittedEdits?: number }).omittedEdits ?? 0), 0),
                     failedEdits: steps.reduce((n, s) => n + ((s as { failedEdits?: number }).failedEdits ?? 0), 0),
                     historyIncomplete: steps.some(s => (s as { historyIncomplete?: boolean }).historyIncomplete || !Array.isArray((s as { edits?: unknown }).edits)) });
             }
         } else if (message.toolName === "loop") {
-            const loop = details?.loopResult as { iterations?: unknown; stoppedBecause?: string } | undefined;
+            const loop = details?.loopResult as { iterations?: unknown; stoppedBecause?: string; finalOutput?: unknown } | undefined;
             const iterations = loop?.iterations;
             if (Array.isArray(iterations)) {
                 const edits = iterations.flatMap(iter => Array.isArray((iter as { edits?: unknown })?.edits) ? (iter as { edits: SavedEdit[] }).edits : []);
+                const output = iterations.map((iter, index) => {
+                    const item = iter as { iteration?: number; output?: unknown } | null;
+                    return `Iteração ${item?.iteration ?? index + 1}\n${savedOutput(item?.output) || "(sem resultado textual)"}`;
+                }).join("\n\n");
                 runs.push({ ...base, kind: "loop", agent: `loop (${iterations.length} iter.)`, edits,
+                    output: output || savedOutput(loop?.finalOutput),
                     status: loop?.stoppedBecause === "error" ? "failed" : "completed",
                     omittedEdits: iterations.reduce((n, s) => n + ((s as { omittedEdits?: number }).omittedEdits ?? 0), 0),
                     failedEdits: iterations.reduce((n, s) => n + ((s as { failedEdits?: number }).failedEdits ?? 0), 0),

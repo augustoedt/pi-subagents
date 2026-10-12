@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectAgentEdits, editPreviewNotice, latestSubagentEdits, listSubagentRuns, moveEditPreview } from "../lib/subagent-edits";
+import { MAX_SUBAGENT_RUNS, collectAgentEdits, editPreviewNotice, latestSubagentEdits, listSubagentRuns, moveEditPreview } from "../lib/subagent-edits";
 
 const result = (recentTools: unknown[], toolName = "subagent") => ({
     type: "message",
@@ -46,6 +46,24 @@ describe("/se latest subagent edits", () => {
             ]);
     });
 
+    it("keeps only the latest ten executions, including scout/researcher without edits", () => {
+        const entries = Array.from({ length: 12 }, (_, i) => ({ type: "message", id: `run-${i}`,
+            message: { role: "toolResult", toolName: "subagent", details: { results: [{
+                agent: i % 2 ? "researcher" : "scout", output: `Finding ${i}`, progress: { recentTools: [] },
+            }] } } }));
+        const runs = listSubagentRuns(entries);
+        expect(runs).toHaveLength(MAX_SUBAGENT_RUNS);
+        expect(runs.map(run => run.id)).toEqual(Array.from({ length: 10 }, (_, i) => `run-${11 - i}`));
+        expect(runs[0]).toMatchObject({ agent: "researcher", output: "Finding 11", edits: [] });
+        expect(runs[1]).toMatchObject({ agent: "scout", output: "Finding 10", edits: [] });
+    });
+
+    it("caps parallel results from one tool call at ten executions", () => {
+        const branch = [{ type: "message", message: { role: "toolResult", toolName: "subagent",
+            details: { results: Array.from({ length: 12 }, (_, i) => ({ agent: `agent-${i}`, output: `Result ${i}` })) } } }];
+        expect(listSubagentRuns(branch).map(run => run.agent)).toEqual(Array.from({ length: 10 }, (_, i) => `agent-${i}`));
+    });
+
     it("uses the latest subagent, even when it has no edits", () => {
         const earlier = result([{ tool: "edit", args: "earlier.txt", editSucceeded: true, editDiff: "- a\n+ b" }]);
         expect(latestSubagentEdits([earlier, result([])])).toEqual([]);
@@ -71,17 +89,18 @@ describe("/se latest subagent edits", () => {
     it("lists saved pipeline and loop edits with agent attribution", () => {
         const pipeline = { type: "message", id: "p", message: { role: "toolResult", toolName: "pipeline",
             details: { pipelineResult: { steps: [
-                { agent: "scout", edits: [] },
-                { agent: "worker", edits: [{ file: "pipeline.txt", diff: "+ p", agent: "worker" }] },
+                { agent: "scout", output: "Relevant file found", edits: [] },
+                { agent: "worker", output: "Updated file", edits: [{ file: "pipeline.txt", diff: "+ p", agent: "worker" }] },
             ] } } } };
         const loop = { type: "message", id: "l", message: { role: "toolResult", toolName: "loop",
             details: { loopResult: { iterations: [
-                { iteration: 1, edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
+                { iteration: 1, output: "First pass", edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
             ] } } } };
         expect(listSubagentRuns([pipeline, loop])).toMatchObject([
             { id: "l", kind: "loop", agent: "loop (1 iter.)", timestamp: undefined,
-              edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
+              output: "Iteração 1\nFirst pass", edits: [{ file: "loop.txt", diff: "+ l", agent: "worker" }] },
             { id: "p", kind: "pipeline", agent: "pipeline: scout → worker", timestamp: undefined,
+              output: "1. scout\nRelevant file found\n\n2. worker\nUpdated file",
               edits: [{ file: "pipeline.txt", diff: "+ p", agent: "worker" }] },
         ]);
     });
@@ -101,6 +120,15 @@ describe("/se latest subagent edits", () => {
                 { file: "old.txt", diff: "- old\n+ middle", agent: "worker" },
                 { file: "new.txt", diff: "- middle\n+ final", agent: "worker" },
             ] }]);
+    });
+
+    it("shows a failed agent's saved error when it has no textual output", () => {
+        const entry = { type: "message", message: { role: "toolResult", toolName: "subagent",
+            details: { results: [{ agent: "researcher", exitCode: 1, progress: {
+                status: "failed", error: "Research failed", recentTools: [],
+            } }] } } };
+        expect(listSubagentRuns([entry])).toMatchObject([{ agent: "researcher", status: "failed",
+            edits: [], output: "Research failed" }]);
     });
 
     it("warns that older sessions may lack evicted edit history", () => {
