@@ -1,13 +1,20 @@
-/** Bounded, display-only preview of edit tool replacements (not a repository diff). */
+/** Bounded, per-call diffs of edit replacements (not repository-wide diffs). */
 const MAX_DIFF_CHARS = 8_000;
 const MAX_DIFF_LINES = 100;
+const MAX_FULL_DIFF_CHARS = 32_000;
+const MAX_FULL_DIFF_LINES = 500;
+const MAX_SOURCE_CHARS = 128_000;
 export const DIFF_TRUNCATED_MARKER = "… diff preview truncated; remaining lines from this edit were not stored";
+export const INLINE_TRUNCATED_MARKER = "… inline preview truncated; open /se for this edit";
+export const FULL_DIFF_LIMIT_MARKER = "… per-edit safety limit reached; remaining lines were not stored";
 export const LARGE_EDIT_MARKER = "… large edit: replacement preview without line alignment";
+export const SOURCE_LIMIT_MARKER = "… edit exceeds safe source size; diff was not captured";
 
 type Replacement = { oldText: string; newText: string };
 
 function replacementDiff({ oldText, newText }: Replacement): string[] {
     if (oldText === newText) return [];
+    if (oldText.length + newText.length > MAX_SOURCE_CHARS) return [SOURCE_LIMIT_MARKER];
     const before = oldText.split("\n");
     const after = newText.split("\n");
     // Ignore the empty split element caused by a final newline.
@@ -22,7 +29,7 @@ function replacementDiff({ oldText, newText }: Replacement): string[] {
         after.pop();
     }
     // Bound the alignment work; large edits are still shown as replacements.
-    if (before.length > 200 || after.length > 200) {
+    if (before.length > MAX_FULL_DIFF_LINES || after.length > MAX_FULL_DIFF_LINES) {
         return [LARGE_EDIT_MARKER,
             ...before.map(line => `- ${line}`), ...after.map(line => `+ ${line}`)];
     }
@@ -49,7 +56,7 @@ function replacementDiff({ oldText, newText }: Replacement): string[] {
     return lines;
 }
 
-export function previewEditDiff(args: Record<string, unknown>): string | undefined {
+function formatEditDiff(args: Record<string, unknown>, maxLines: number, maxChars: number, limitMarker: string): string | undefined {
     const edits = Array.isArray(args.edits)
         ? args.edits
         : [{ oldText: args.oldText ?? args.old_string, newText: args.newText ?? args.new_string }];
@@ -62,8 +69,8 @@ export function previewEditDiff(args: Record<string, unknown>): string | undefin
         if (!changed.length) continue;
         const chunk = edits.length > 1 ? [`@@ edit ${i + 1} @@`, ...changed] : changed;
         for (const line of chunk) {
-            if (lines.length >= MAX_DIFF_LINES || chars + line.length > MAX_DIFF_CHARS) {
-                lines.push(DIFF_TRUNCATED_MARKER);
+            if (lines.length >= maxLines || chars + line.length > maxChars) {
+                lines.push(limitMarker);
                 return lines.join("\n");
             }
             lines.push(line);
@@ -71,4 +78,13 @@ export function previewEditDiff(args: Record<string, unknown>): string | undefin
         }
     }
     return lines.length ? lines.join("\n") : undefined;
+}
+
+export function previewEditDiff(args: Record<string, unknown>): string | undefined {
+    return formatEditDiff(args, MAX_DIFF_LINES, MAX_DIFF_CHARS, DIFF_TRUNCATED_MARKER);
+}
+
+/** A larger per-call diff, stored only in the final tool result for /se. */
+export function fullEditDiff(args: Record<string, unknown>): string | undefined {
+    return formatEditDiff(args, MAX_FULL_DIFF_LINES, MAX_FULL_DIFF_CHARS, FULL_DIFF_LIMIT_MARKER);
 }

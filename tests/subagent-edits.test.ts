@@ -20,6 +20,20 @@ describe("/se latest subagent edits", () => {
         ]);
     });
 
+    it("prefers the longer per-call diff in /se and falls back for older sessions", () => {
+        const branch = [result([
+            { tool: "edit", args: "new.txt", editSucceeded: true,
+              editDiff: "- old\n… inline preview truncated; open /se for this edit",
+              editFullDiff: "- old\n+ new\n+ last" },
+            { tool: "edit", args: "legacy.txt", editSucceeded: true,
+              editDiff: "- old\n… diff preview truncated; use git diff for full changes" },
+        ])];
+        expect(latestSubagentEdits(branch)).toEqual([
+            { file: "new.txt", diff: "- old\n+ new\n+ last" },
+            { file: "legacy.txt", diff: "- old\n… diff preview truncated; use git diff for full changes" },
+        ]);
+    });
+
     it("uses the latest subagent, even when it has no edits", () => {
         const earlier = result([{ tool: "edit", args: "earlier.txt", editSucceeded: true, editDiff: "- a\n+ b" }]);
         expect(latestSubagentEdits([earlier, result([])])).toEqual([]);
@@ -36,9 +50,13 @@ describe("/se latest subagent edits", () => {
 
     it("warns for current and previously saved truncated previews", () => {
         expect(editPreviewNotice("- old\n… diff preview truncated; remaining lines from this edit were not stored"))
-            .toContain("Prévia incompleta");
+            .toContain("Prévia antiga incompleta");
         expect(editPreviewNotice("… diff preview truncated; use git diff for full changes"))
-            .toContain("Prévia incompleta");
+            .toContain("Prévia antiga incompleta");
+        expect(editPreviewNotice("… per-edit safety limit reached; remaining lines were not stored"))
+            .toContain("Limite de segurança");
+        expect(editPreviewNotice("… edit exceeds safe source size; diff was not captured"))
+            .toContain("diff não capturado");
         expect(editPreviewNotice("… large edit: replacement preview without line alignment"))
             .toContain("Alinhamento");
         expect(editPreviewNotice("- old\n+ new")).toBeUndefined();

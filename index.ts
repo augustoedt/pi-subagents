@@ -25,7 +25,7 @@ import { validateAgentGraphAcyclicity } from "./lib/agent-graph";
 import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
-import { previewEditDiff } from "./lib/tool-edit-diff";
+import { DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER, fullEditDiff, previewEditDiff } from "./lib/tool-edit-diff";
 import { editPreviewNotice, latestSubagentEdits, moveEditPreview } from "./lib/subagent-edits";
 
 interface ToolEvent {
@@ -43,6 +43,8 @@ interface ToolEvent {
 	status: "running" | "done";
 	/** Bounded replacement preview; only displayed for successful edits in expanded mode. */
 	editDiff?: string;
+	/** Larger bounded diff added only to the final result (not live progress). */
+	editFullDiff?: string;
 	editSucceeded?: boolean;
 	/**
 	 * Live progress of subagents spawned by this tool call. Populated only for
@@ -647,6 +649,7 @@ async function runSubagent(
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		const isRetry = attempt > 1;
+		const fullDiffs = new Map<string, string>();
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn(command, spawnArgs, {
@@ -732,10 +735,15 @@ async function runSubagent(
 					inFlightToolCount++;
 					pauseIdle();
 					progress.toolCount++;
+					const toolArgs = (evt.args || {}) as Record<string, unknown>;
+					const fullDiff = evt.toolName === "edit" ? fullEditDiff(toolArgs) : undefined;
+					if (fullDiff && evt.toolCallId) fullDiffs.set(evt.toolCallId, fullDiff);
+					const preview = evt.toolName === "edit" ? previewEditDiff(toolArgs) : undefined;
 					progress.recentTools.push({
 						tool: evt.toolName,
-						args: extractToolArgsPreview((evt.args || {}) as Record<string, unknown>),
-						editDiff: evt.toolName === "edit" ? previewEditDiff((evt.args || {}) as Record<string, unknown>) : undefined,
+						args: extractToolArgsPreview(toolArgs),
+						editDiff: fullDiff && preview?.includes(DIFF_TRUNCATED_MARKER)
+							? preview.replace(DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER) : preview,
 						toolCallId: evt.toolCallId,
 						status: "running",
 					});
@@ -745,7 +753,8 @@ async function runSubagent(
 					while (progress.recentTools.length > MAX_RECENT_TOOLS) {
 						const idx = progress.recentTools.findIndex((t) => t.status !== "running");
 						if (idx === -1) break; // only running entries left — don't evict in-flight
-						progress.recentTools.splice(idx, 1);
+						const removed = progress.recentTools.splice(idx, 1)[0];
+						if (removed?.toolCallId) fullDiffs.delete(removed.toolCallId);
 					}
 					// ── Cycle detection (parent-side, context-free) ──
 					// Signature = toolName + args preview. Two calls with different args
@@ -958,6 +967,10 @@ async function runSubagent(
 			continue; // retry with fresh callHistory
 		}
 
+		// Attach larger diffs only to the terminal result, not to repeated live updates.
+		for (const call of progress.recentTools) {
+			if (call.editSucceeded && call.toolCallId) call.editFullDiff = fullDiffs.get(call.toolCallId);
+		}
 		// Success or non-loop failure — return result
 		return result;
 	}

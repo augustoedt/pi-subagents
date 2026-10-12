@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { previewEditDiff } from "../lib/tool-edit-diff";
+import { fullEditDiff, previewEditDiff } from "../lib/tool-edit-diff";
 
 describe("edit preview", () => {
     it("shows only changed lines, not unchanged replacement context", () => {
@@ -41,6 +41,40 @@ describe("edit preview", () => {
         }] });
         expect(preview).toContain("diff preview truncated; remaining lines from this edit were not stored");
         expect(preview!.split("\n").length).toBeLessThanOrEqual(101);
+    });
+
+    it("retains all 120 changed lines from one edit for /se, while bounding the inline preview", () => {
+        const args = { edits: [{
+            oldText: Array.from({ length: 60 }, (_, i) => `old ${i}`).join("\n"),
+            newText: Array.from({ length: 60 }, (_, i) => `new ${i}`).join("\n"),
+        }] };
+        expect(previewEditDiff(args)).toContain("diff preview truncated");
+        const full = fullEditDiff(args)!;
+        expect(full.split("\n")).toHaveLength(120);
+        expect(full).toContain("+ new 59");
+        expect(full).not.toContain("safety limit");
+    });
+
+    it("keeps multiple replacements grouped in one full per-call diff", () => {
+        const full = fullEditDiff({ edits: [
+            { oldText: "one", newText: "two" },
+            { oldText: "three", newText: "four" },
+        ] });
+        expect(full).toBe("@@ edit 1 @@\n- one\n+ two\n@@ edit 2 @@\n- three\n+ four");
+    });
+
+    it("reports when input exceeds the safe source size without copying it into the result", () => {
+        expect(fullEditDiff({ oldText: "x".repeat(130_000), newText: "y" }))
+            .toBe("… edit exceeds safe source size; diff was not captured");
+    });
+
+    it("marks the per-call safety limit when the full diff exceeds 500 lines", () => {
+        const full = fullEditDiff({ edits: [{
+            oldText: Array.from({ length: 300 }, (_, i) => `old ${i}`).join("\n"),
+            newText: Array.from({ length: 300 }, (_, i) => `new ${i}`).join("\n"),
+        }] })!;
+        expect(full.split("\n")).toHaveLength(501);
+        expect(full).toContain("per-edit safety limit reached");
     });
 
     it("bounds large previews and explains that omitted lines were not stored", () => {
