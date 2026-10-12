@@ -26,6 +26,7 @@ import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 import { previewEditDiff } from "./lib/tool-edit-diff";
+import { latestSubagentEdits } from "./lib/subagent-edits";
 
 interface ToolEvent {
 	tool: string;
@@ -1547,6 +1548,50 @@ export default function (pi: ExtensionAPI) {
 	if (SUBAGENT_ALLOWLIST) {
 		agents = agents.filter((a) => SUBAGENT_ALLOWLIST.includes(a.name));
 	}
+
+	pi.registerCommand("se", {
+		description: "Explorar as edições do último subagente",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/se requires interactive mode", "error");
+				return;
+			}
+			const edits = latestSubagentEdits(ctx.sessionManager.getBranch());
+			if (!edits.length) {
+				ctx.ui.notify("The latest subagent has no recorded successful edits", "info");
+				return;
+			}
+			const options = edits.map((edit, index) => `${index + 1}. ${edit.file}`);
+			while (true) {
+				const selected = await ctx.ui.select(`Subagent edits (${edits.length})`, options);
+				if (!selected) return;
+				const index = options.indexOf(selected);
+				if (index < 0) return;
+				const edit = edits[index]!;
+				await ctx.ui.custom<void>((tui, theme, kb, done) => {
+					let offset = 0;
+					return {
+						render(width) {
+							const title = new Text(theme.fg("accent", `Edit ${index + 1}/${edits.length} · ${edit.file}`), 0, 0).render(width);
+							const diff = edit.diff.split("\n").map(line =>
+								theme.fg(line.startsWith("- ") ? "error" : line.startsWith("+ ") ? "success" : "muted", line),
+							).join("\n");
+							const lines = new Text(diff, 0, 0).render(width);
+							const visible = 12;
+							offset = Math.min(offset, Math.max(0, lines.length - visible));
+							const footer = new Text(theme.fg("dim", `↑↓ scroll · Esc back · ${Math.min(offset + 1, lines.length)}–${Math.min(offset + visible, lines.length)}/${lines.length}`), 0, 0).render(width);
+							return [...title, "", ...lines.slice(offset, offset + visible), "", ...footer];
+						},
+						handleInput(data) {
+							if (kb.matches(data, "tui.select.cancel")) done(undefined);
+							else if (kb.matches(data, "tui.select.up")) { offset = Math.max(0, offset - 1); tui.requestRender(); }
+							else if (kb.matches(data, "tui.select.down")) { offset++; tui.requestRender(); }
+						},
+					};
+				});
+			}
+		},
+	});
 
 	pi.registerTool({
 		name: "subagent",
