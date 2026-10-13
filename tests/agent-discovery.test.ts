@@ -1,5 +1,6 @@
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
-import { mergeAgents, parseAgentMd, substitutePlaceholders, formatConnectorContext, type AgentConfig } from "../lib/helpers";
+import { discoverAgents, mergeAgents, parseAgentMd, substitutePlaceholders, formatConnectorContext, type AgentConfig } from "../lib/helpers";
 
 function makeAgent(name: string, description: string): AgentConfig {
     return {
@@ -12,6 +13,20 @@ function makeAgent(name: string, description: string): AgentConfig {
         filePath: `agents/${name}.md`,
     };
 }
+
+describe("built-in reviewer", () => {
+    it("is discoverable and cannot call file mutation or shell tools", () => {
+        const agents = discoverAgents(fileURLToPath(new URL("../agents/", import.meta.url)));
+        const reviewer = agents.find(agent => agent.name === "reviewer");
+        expect(reviewer).toMatchObject({
+            name: "reviewer", tools: ["read", "grep", "find", "ls"],
+            model: "inherit", thinking: "high",
+        });
+        expect(reviewer?.connector).toBe("## Review findings:\n\n{output}");
+        expect(reviewer?.systemPrompt).toContain("YES or NO alone on the first nonempty line");
+        expect(agents.filter(agent => agent.name === "reviewer")).toHaveLength(1);
+    });
+});
 
 describe("mergeAgents", () => {
     it("returns built-in agents when no user agents", () => {

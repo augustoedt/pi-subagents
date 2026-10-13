@@ -1,7 +1,7 @@
 /**
  * Minimal subagents extension.
  *
- * Registers a single `subagent` tool with three agents: scout, researcher, worker.
+ * Registers subagent orchestration with scout, researcher, reviewer, and worker.
  * Supports single and parallel execution. Output is verbal only (no file handoff).
  */
 import { spawn } from "node:child_process";
@@ -1745,7 +1745,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run subagents for delegated tasks",
 		promptGuidelines: [
 			"Parallel tool calls are your primary parallelism mechanism — put multiple independent read/fetch/search calls in one function_calls block. Don't use subagents to parallelize simple I/O.",
-			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
+			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), read-only code/security review (reviewer), or isolated code changes (worker)",
 			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
 			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
 			"When a subagent returns an error, read it carefully. For transient failures (timeout, API/network), retry once with the same task plus 'Previous attempt failed with: {error}'. For structural failures (wrong approach, missing context), simplify the task or switch agents. If it persists after retry, report to the user with the specific error.",
@@ -1894,7 +1894,7 @@ export default function (pi: ExtensionAPI) {
 		name: "pipeline",
 		label: "Pipeline",
 		description:
-			"Run 2–5 agents in sequence. Each agent's output feeds as {previous} context into the next agent's task. Use for multi-stage workflows like scout → planner → worker.",
+			"Run 2–5 agents in sequence. Each agent's output feeds as {previous} context into the next agent's task. Use for multi-stage workflows like scout → worker → reviewer.",
 		promptSnippet: "Run sequential multi-agent pipelines",
 		promptGuidelines: [
 			"Use pipeline when a task naturally decomposes into sequential agent roles (e.g. explore → plan → implement → review).",

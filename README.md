@@ -1,6 +1,6 @@
 # @rohaquinlop/pi-subagents
 
-A [pi](https://github.com/earendil-works/pi) extension that registers three agent orchestration tools — `subagent`, `pipeline`, and `loop` — with three built-in agents:
+A [pi](https://github.com/earendil-works/pi) extension that registers three agent orchestration tools — `subagent`, `pipeline`, and `loop` — with four built-in agents:
 
 ## Installation
 
@@ -12,6 +12,7 @@ pi install @rohaquinlop/pi-subagents
 |-------|-------|-------|---------|
 | **scout** | read, grep, find, ls | deepseek-v4-flash | Fast codebase recon |
 | **researcher** | web_search, web_fetch | deepseek-v4-flash | Web research |
+| **reviewer** | read, grep, find, ls | inherit (high thinking) | Read-only code and security review |
 | **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | deepseek-v4-flash | Code changes (can dispatch scout/researcher to protect its own context) |
 
 `worker` is allowlisted to spawn only `scout` and `researcher` (via `subagent_agents` in its frontmatter), so the chain stops at depth 2 — a worker cannot recurse into another worker.
@@ -31,7 +32,12 @@ One tool call = one subagent:
 
 To fan out, emit multiple `subagent` tool calls in the same assistant turn — pi runs them in parallel automatically. A per-process semaphore caps simultaneous subagents at `maxConcurrency` (default 4); calls past the cap wait their turn.
 
-Each subagent runs as an isolated `pi` process with no inherited context — all context must be in the task description.
+Each subagent runs as an isolated `pi` process with no inherited context — all context must be in the task description. The `reviewer` has no edit, write, or shell tools; provide paths and review criteria in the task. It inherits the parent session's model.
+
+For a security review:
+```json
+{ "agent": "reviewer", "task": "Review authentication changes in src/auth/ for concrete security defects. Report severity, file and line, impact, and fix. Do not change files." }
+```
 
 ### Pipeline — Sequential Agent Chains
 
