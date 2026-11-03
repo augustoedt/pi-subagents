@@ -3,7 +3,8 @@
 Antes de retomar trabalho, ler nesta ordem:
 1. `docs/README.md`.
 2. `docs/checkpoints/project-state.md`.
-3. O plano ativo indicado no checkpoint.
+3. O plano ativo indicado no checkpoint, se houver; consultar a tabela
+   “Antes de…” no índice para testes, ativação e rollback.
 
 A `main` é reservada para atualizações do repositório original. Trabalhar na
 feature aprovada; não fazer merge, commit ou push sem autorização.

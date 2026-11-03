@@ -20,6 +20,17 @@ describe("/se latest subagent edits", () => {
         ]);
     });
 
+    it("collects successful scoped_edit diffs with agent attribution, but excludes failures", () => {
+        const child = { agent: "worker", progress: { recentTools: [
+            { tool: "scoped_edit", args: "protected.ts", editSucceeded: true, editDiff: "- old\\n+ new" },
+            { tool: "scoped_edit", args: "failed.ts", editSucceeded: false, editDiff: "- a\\n+ b" },
+            { tool: "scoped_write", args: "written.ts", editSucceeded: true, editDiff: "- old\\n+ write" },
+        ] } };
+        expect(collectAgentEdits(child)).toEqual([
+            { file: "protected.ts", diff: "- old\\n+ new", agent: "worker" },
+        ]);
+    });
+
     it("prefers the longer per-call diff in /se and falls back for older sessions", () => {
         const branch = [result([
             { tool: "edit", args: "new.txt", editSucceeded: true,

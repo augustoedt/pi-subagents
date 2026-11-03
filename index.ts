@@ -31,8 +31,15 @@ import { EditArchive } from "./lib/edit-archive";
 import { preflightAgent, validateRuntimeConfig } from "./lib/preflight";
 import { prepareDelegationTask, type DelegationContext } from "./lib/delegation-context";
 import { DeliveryCollector, deliveryText, REPORT_TOOL, REPORT_INSTRUCTIONS, type Delivery } from "./lib/delivery";
+import { normalizeMutationTool } from "./lib/tool-names";
+import { planRestrictedAgent, prepareScopeArguments, restrictedNotice, type RestrictedPlan } from "./lib/restricted-mode";
+import { WRITE_SCOPE_ENV, parseWriteScopeEnv } from "./lib/write-scope";
 
 const delegationProperties = () => ({
+	write_scope: Type.Optional(Type.Array(Type.Object({
+		path: Type.String({ minLength: 1, maxLength: 2000, description: "Exact file or existing directory, relative to cwd or absolute; no globs, @, ~/, or file URLs." }),
+		kind: Type.Union([Type.Literal("file"), Type.Literal("directory")]),
+	}), { maxItems: 20, description: "Enforced write scope. [] denies all writes. Disables shell/code execution, custom/network tools and subdelegation; coordinator runs tests. No scope preserves the agent profile. Not an OS sandbox." })),
 	context_files: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20, description: "Existing readable reference files relative to cwd (or absolute). Paths only, no auto-injection of contents; no globs." })),
 	acceptance: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20, description: "Explicit acceptance criteria. Not automatically verified; the coordinator must inspect evidence." })),
 	constraints: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20, description: "Task restrictions and exclusions. Prompt instructions, NOT an enforced sandbox or file lock." })),
@@ -140,7 +147,7 @@ export const ENV_ALLOWLIST_BASE = new Set([
 	"TMPDIR", "TEMP", "TMP",
 	"NODE_OPTIONS", "NODE_PATH",
 	"PI_IS_SUBAGENT", "PI_SUBAGENT_ALLOWED", "PI_SUBAGENT_DEPTH",
-	"PI_SUBAGENT_INHERIT_MODEL",
+	"PI_SUBAGENT_INHERIT_MODEL", WRITE_SCOPE_ENV,
 	"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
 	"GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
 	"MISTRAL_API_KEY", "COHERE_API_KEY", "XAI_API_KEY",
@@ -227,6 +234,8 @@ function buildCustomToolExtensions(): Record<string, string> {
 	// Hardcoded entries for tools in non-standard locations not under EXT_BASE
 	map.safe_bash ??= path.join(TOOLS_DIR, "safe-bash.ts");
 	map.subagent ??= path.join(EXT_DIR, "index.ts");
+	// Scope guards must always come from this package, never dynamic discovery.
+	map.scoped_edit = map.scoped_write = path.join(TOOLS_DIR, "scoped-mutations.ts");
 
 	return map;
 }
@@ -462,10 +471,19 @@ function resolveAgentForDispatch(agent: AgentConfig): AgentConfig {
 	return { ...agent, model: resolution.model };
 }
 
+interface DispatchPlan extends RestrictedPlan { cwd: string }
+
+function prepareDispatch(rawAgent: AgentConfig, cwd: string, context?: DelegationContext): DispatchPlan {
+	const plan = planRestrictedAgent(resolveAgentForDispatch(rawAgent), context?.write_scope, cwd, process.env[WRITE_SCOPE_ENV]);
+	const prepared = preflightAgent(cwd, plan.agent, BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
+	return { ...plan, cwd: prepared.cwd };
+}
+
 async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
+	plan: DispatchPlan,
 ): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv }> {
 	const piBin = resolvePiBinary();
 
@@ -477,6 +495,8 @@ async function buildPiArgs(
 		throw new Error(depthResult.error!);
 	}
 
+	// Revalidate pinned roots, never re-resolve raw declarations on retry.
+	if (plan.scope) parseWriteScopeEnv(JSON.stringify(plan.scope));
 	const prepared = preflightAgent(cwd, agent, BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
 	const reportExtension = path.join(TOOLS_DIR, "subagent-report.ts");
 	fs.accessSync(reportExtension, fs.constants.R_OK);
@@ -485,10 +505,11 @@ async function buildPiArgs(
 	// Write system prompt to temp file
 	const promptPath = path.join(tempDir, `${agent.name}.md`);
 	await withFileMutationQueue(promptPath, async () => {
-		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${REPORT_INSTRUCTIONS}`, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${REPORT_INSTRUCTIONS}${restrictedNotice(plan)}`, { encoding: "utf-8", mode: 0o600 });
 	});
 
 	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session", "--no-skills"];
+	if (plan.scope) args.push("--exclude-tools", plan.excludedTools.join(","), "--no-mcp");
 
 	// Separate builtin tools from custom tools. Both kinds share the same
 	// --tools allowlist in pi; --no-tools would disable extension tools too.
@@ -561,6 +582,11 @@ async function buildPiArgs(
 
 	if (extensionConfig.envExtra) Object.assign(overrides, extensionConfig.envExtra);
 	const childEnv = buildChildEnv(overrides, extensionConfig.envAllowlist);
+	// Guard state wins over user config and inherited ambient environment.
+	if (plan.scope) {
+		childEnv[WRITE_SCOPE_ENV] = JSON.stringify(plan.scope);
+		childEnv.PI_SUBAGENT_ALLOWED = "__scoped_no_delegation__";
+	} else delete childEnv[WRITE_SCOPE_ENV];
 
 	return { args: [piBin.command, ...args], tempDir, childEnv };
 }
@@ -620,11 +646,13 @@ async function runSubagent(
 	signal: AbortSignal | undefined,
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"], finalExitCode?: number) => void,
 	context?: DelegationContext,
+	preparedPlan?: DispatchPlan,
 ): Promise<AgentResult> {
 	// Resolve `$tier` / `inherit` once, here, so every downstream consumer —
 	// spawn args, result metadata, the TUI — sees the same concrete model.
-	const agent = resolveAgentForDispatch(rawAgent);
-	cwd = preflightAgent(cwd, agent, BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS).cwd;
+	const plan = preparedPlan ?? prepareDispatch(rawAgent, cwd, context);
+	const agent = plan.agent;
+	cwd = plan.cwd;
 	task = prepareDelegationTask(task, context, cwd);
 	signal?.throwIfAborted();
 	const evidence = new DeliveryCollector();
@@ -664,7 +692,7 @@ async function runSubagent(
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		// Each retry needs a fresh prompt/temp directory (the prior one is removed).
-		const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
+		const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd, plan);
 		const command = args[0];
 		const spawnArgs = args.slice(1);
 		const fullDiffs = new Map<string, string>();
@@ -760,9 +788,9 @@ async function runSubagent(
 					progress.toolCount++;
 					const toolArgs = (evt.args || {}) as Record<string, unknown>;
 					evidence.start(evt.toolCallId, evt.toolName, toolArgs);
-					const fullDiff = evt.toolName === "edit" ? fullEditDiff(toolArgs) : undefined;
+					const fullDiff = normalizeMutationTool(evt.toolName) === "edit" ? fullEditDiff(toolArgs) : undefined;
 					if (fullDiff && evt.toolCallId) fullDiffs.set(evt.toolCallId, fullDiff);
-					const preview = evt.toolName === "edit" ? previewEditDiff(toolArgs) : undefined;
+					const preview = normalizeMutationTool(evt.toolName) === "edit" ? previewEditDiff(toolArgs) : undefined;
 					progress.recentTools.push({
 						tool: evt.toolName,
 						args: extractToolArgsPreview(toolArgs),
@@ -832,13 +860,13 @@ async function runSubagent(
 
 				if (evt.type === "tool_execution_end") {
 					evidence.end(evt.toolCallId, evt.toolName, evt.result, evt.isError);
-					if (evt.toolName === "edit" && evt.isError) failedEdits++;
+					if (normalizeMutationTool(evt.toolName) === "edit" && evt.isError) failedEdits++;
 					const hit = evt.toolCallId
 						? progress.recentTools.find((t) => t.toolCallId === evt.toolCallId)
 						: undefined;
 					if (hit) {
 						hit.status = "done";
-						hit.editSucceeded = evt.toolName === "edit" && !evt.isError;
+						hit.editSucceeded = normalizeMutationTool(evt.toolName) === "edit" && !evt.isError;
 						// Prefer the end event's final results over the last throttled
 						// update — throttling can drop the trailing update, leaving stale
 						// children visible on a tool that has actually completed.
@@ -1020,6 +1048,7 @@ async function runSubagent(
 		progress.failedEdits = priorFailedEdits + failedEdits + evictedChildFailures;
 		progress.historyIncomplete = priorHistoryIncomplete || evictedHistoryIncomplete;
 		result.delivery = evidence.finish(signal?.aborted ? "cancelled" : progress.status === "completed" ? "completed" : "failed");
+		if (plan.scope) result.delivery.restriction = { scope: plan.scope, disabledTools: plan.disabledTools };
 		// Success or non-loop failure — return result
 		return result;
 	}
@@ -1268,6 +1297,8 @@ async function runPipeline(
 	signal: AbortSignal | undefined,
 	onUpdate?: (stepIndex: number, progress: AgentProgress, usage: AgentUsage) => void,
 ): Promise<PipelineResult> {
+	// Prepare policies before any step runs; pin canonical paths (not inode identities).
+	const plans = steps.map(step => prepareDispatch(agents.find(a => a.name === step.agent)!, cwd, step));
 	const results: PipelineStepResult[] = [];
 	let previousOutput = "";
 	let totalUsage = zeroUsage();
@@ -1304,7 +1335,7 @@ async function runPipeline(
 		const result = await semaphore.run(() =>
 			runSubagent(agent, taskWithContext, cwd, signal, (progress, usage) => {
 				onUpdate?.(i, progress, usage);
-			}, step),
+			}, step, plans[i]),
 		).catch(error => dispatchFailure(agent, taskWithContext, error));
 
 		const stepResult: PipelineStepResult = {
@@ -1351,6 +1382,8 @@ async function runLoop(
 ): Promise<LoopResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+	const runnerPlan = prepareDispatch(agent, cwd, context);
+	const judgePlan = judge ? prepareDispatch(agents.find(a => a.name === judge.agent)!, cwd, context) : undefined;
 
 	const iterations: LoopIterationResult[] = [];
 	let priorOutputs: string[] = [];
@@ -1384,7 +1417,7 @@ async function runLoop(
 		const result = await semaphore.run(() =>
 			runSubagent(agent, fullTask, cwd, signal, (progress, usage) => {
 				onUpdate?.(i, progress, usage);
-			}, context),
+			}, context, runnerPlan),
 		).catch(error => dispatchFailure(agent, fullTask, error));
 
 		const iterResult: LoopIterationResult = {
@@ -1402,7 +1435,7 @@ async function runLoop(
 			if (judgeAgent) {
 				const judgePrompt = `Evaluate this output against the criteria below. Respond with YES if satisfied, or NO with specific feedback.\n\nCriteria: ${judge.criteria}\n\nOutput and observed evidence to evaluate:\n${deliveryContent(result)}`;
 				const judgeResult = await semaphore.run(() =>
-					runSubagent(judgeAgent, judgePrompt, cwd, signal, undefined, context),
+					runSubagent(judgeAgent, judgePrompt, cwd, signal, undefined, context, judgePlan),
 				).catch(error => dispatchFailure(judgeAgent, judgePrompt, error));
 				totalUsage = accumulateUsage(totalUsage, judgeResult.usage);
 				iterResult.edits?.push(...collectAgentEdits(judgeResult));
@@ -1775,6 +1808,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
+		prepareArguments: prepareScopeArguments,
 		description:
 			"Run a subagent to complete a task. Subagents have NO context from the current conversation — include all necessary context in the task description.",
 		promptSnippet: "Run subagents for delegated tasks",
@@ -1783,6 +1817,7 @@ export default function (pi: ExtensionAPI) {
 			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), read-only code/security review (reviewer), or isolated code changes (worker)",
 			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
 			"Subagents have NO context from the current conversation — supply task plus optional context_files, acceptance and constraints. These fields grant no extra permissions and constraints are not an enforced sandbox.",
+			"For subagent/pipeline/loop code changes, set write_scope to the smallest authorized files/directories when the worker does not need shell or subdelegation. In scoped mode those tools are unavailable: run builds/tests in the coordinator. Never widen scope beyond user authorization. This is not an OS sandbox.",
 			"For subagent, pipeline and loop, distinguish process completion, agent declarations and observed tool evidence. A zero exit or a judge YES does not prove tests or acceptance passed. Inspect missing checks, failed commands and incomplete evidence.",
 			"When a subagent returns an error, read it carefully. For transient failures (timeout, API/network), retry once with the same task plus 'Previous attempt failed with: {error}'. For structural failures (wrong approach, missing context), simplify the task or switch agents. If it persists after retry, report to the user with the specific error.",
 		],
@@ -1928,6 +1963,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pipeline",
 		label: "Pipeline",
+		prepareArguments: prepareScopeArguments,
 		description:
 			"Run 2–5 agents in sequence. Each agent's output feeds as {previous} context into the next agent's task. Use for multi-stage workflows like scout → worker → reviewer.",
 		promptSnippet: "Run sequential multi-agent pipelines",
@@ -1965,9 +2001,6 @@ export default function (pi: ExtensionAPI) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				throw new Error(`Unknown agent in pipeline: ${missing}. Available agents: ${available}`);
 			}
-
-			// Check every agent's prerequisites before the first step can mutate files.
-			for (const name of agentNames) preflightAgent(cwd, resolveAgentForDispatch(agents.find(a => a.name === name)!), BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
 
 			const liveResult: Details = {
 				pipelineResult: {
@@ -2065,6 +2098,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "loop",
 		label: "Loop",
+		prepareArguments: prepareScopeArguments,
 		description:
 			"Run the same agent 2–5 times, passing prior iteration outputs as context. Optionally use a judge agent to evaluate quality and stop early.",
 		promptSnippet: "Run iterative refinement loops with optional judge",
@@ -2099,8 +2133,6 @@ export default function (pi: ExtensionAPI) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				throw new Error(`Unknown agent in loop: ${missing}. Available agents: ${available}`);
 			}
-
-			for (const name of agentNames) preflightAgent(cwd, resolveAgentForDispatch(agents.find(a => a.name === name)!), BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
 
 			const liveResult: Details = {
 				loopResult: {

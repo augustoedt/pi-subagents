@@ -26,7 +26,11 @@ sessões ou correções da extensão de background neste recorte.
   e smoke real de carregamento da extensão, sem chamada de modelo paga.
 - [x] Contrato, limites e rollback documentados; substituída somente a entrada
   do pacote em `~/.pi/agent/settings.json` pelo checkout local.
-- [ ] Operador recarregar a sessão e confirmar funcionamento interativo.
+- [x] Recarga confirmada pelo operador, interface nova conferida e scout real
+  executado somente leitura, com `Delivery v1`. Explorer visual não exercitado.
+
+Recorte 1 concluído em `0874e63`. Próximo: [escopo de escrita](write-scope.md),
+com política de shell ainda pendente de confirmação.
 
 Pré-requisito ausente encontrado no ambiente: `researcher` declara `web_search`
 sem mapeamento disponível. Worker/scout/reviewer passaram no preflight real

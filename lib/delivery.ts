@@ -1,3 +1,7 @@
+import { normalizeMutationTool } from "./tool-names";
+import { restrictedNotice } from "./restricted-mode";
+import type { WriteScope } from "./write-scope";
+
 /** A delivery is an agent declaration plus bounded, independently observed tool events.
  * Neither a successful child exit nor a successful shell tool proves acceptance. */
 export interface DeliveryDeclaration {
@@ -21,6 +25,7 @@ export interface CommandEvidence {
 }
 
 export interface Delivery {
+	restriction?: { scope: WriteScope; disabledTools: string[] };
 	version: 1;
 	process: "completed" | "failed" | "cancelled";
 	declaration?: DeliveryDeclaration;
@@ -75,7 +80,7 @@ export class DeliveryCollector {
 	private incomplete = false;
 
 	start(id: unknown, tool: string, args: Record<string, unknown>): void {
-		if (!["edit", "write", "bash", "safe_bash", REPORT_TOOL].includes(tool)) return;
+		if (!["edit", "write", "bash", "safe_bash", REPORT_TOOL].includes(normalizeMutationTool(tool))) return;
 		// A new action after reporting makes that declaration stale.
 		this.declaration = undefined;
 		if (typeof id !== "string" || id.length > MAX_ID || this.pending.size >= MAX_ITEMS) {
@@ -95,7 +100,7 @@ export class DeliveryCollector {
 				? parseDeclaration(result.details.declaration) : undefined;
 			if (parsed) this.declaration = parsed;
 			else this.incomplete = true;
-		} else if (tool === "edit" || tool === "write") {
+		} else if (normalizeMutationTool(tool) === "edit" || normalizeMutationTool(tool) === "write") {
 			this.declaration = undefined;
 			if (isError === false && entry.value) {
 				if (this.fileWrites.size < MAX_ITEMS) this.fileWrites.add(entry.value);
@@ -145,6 +150,7 @@ export function deliveryText(delivery: Delivery | undefined): string {
 	const d = delivery.declaration;
 	const counts = delivery.observed.commands.reduce((a, c) => { a[c.outcome]++; return a; }, { succeeded: 0, failed: 0, unknown: 0 });
 	return `[Delivery v1] Process: ${delivery.process}; agent declaration: ${d?.status ?? "not_reported"}; acceptance: NOT VERIFIED.\n` +
+		(delivery.restriction ? restrictedNotice(delivery.restriction) : "") +
 		`Direct tool evidence: ${delivery.observed.fileWrites.length} file writes; commands ${counts.succeeded} succeeded / ${counts.failed} failed / ${counts.unknown} unknown. ` +
 		`Coverage: direct tools only, not a complete diff; omitted=${delivery.observed.omitted}; incomplete=${delivery.observed.incomplete}.\n` +
 		(d ? `Agent declaration (not independently verified): ${JSON.stringify(d)}\n` : "No structured declaration received.\n") +

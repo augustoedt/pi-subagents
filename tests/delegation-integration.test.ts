@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import extension, { registerAgent } from "../index";
 import { REPORT_TOOL } from "../lib/delivery";
+import { WRITE_SCOPE_ENV, resolveWriteScope } from "../lib/write-scope";
 
 vi.mock("node:child_process", async importOriginal => ({ ...await importOriginal<typeof import("node:child_process")>(), spawn: vi.fn() }));
 const spawned = vi.mocked(spawn);
@@ -24,17 +25,19 @@ let tasks: string[];
 let prompts: string[];
 let promptPaths: string[];
 let originalHome: string | undefined;
+let launches: Array<{ args: string[]; scope?: string }>;
 
 beforeEach(() => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegation-integration-"));
 	originalHome = process.env.HOME; process.env.HOME = root;
 	fs.writeFileSync(path.join(root, "reference.md"), "not auto injected");
-	tools = new Map(); scripts = []; tasks = []; prompts = []; promptPaths = [];
+	tools = new Map(); scripts = []; tasks = []; prompts = []; promptPaths = []; launches = [];
 	extension({ registerCommand: vi.fn(), registerTool: (tool: any) => tools.set(tool.name, tool) } as any);
 	for (const name of ["test-worker", "test-judge"]) registerAgent({ name, description: "test", tools: ["read", "edit", "write", "bash"], model: "test/model", thinking: "low", systemPrompt: "test instructions", filePath: "test.md" });
 	ctx = { cwd: root, model: { provider: "test", id: "model" }, modelRegistry: { find: () => ({ contextWindow: 100000 }) } };
 	spawned.mockReset();
-	spawned.mockImplementation((_cmd, args: any) => {
+	spawned.mockImplementation((_cmd, args: any, options: any) => {
+		launches.push({ args, scope: options?.env?.[WRITE_SCOPE_ENV] });
 		const file = args[args.indexOf("--append-system-prompt") + 1];
 		promptPaths.push(file); prompts.push(fs.readFileSync(file, "utf8"));
 		const last = args.at(-1); tasks.push(last.startsWith("@") ? fs.readFileSync(last.slice(1), "utf8") : last);
@@ -66,6 +69,7 @@ describe("actual registered orchestration tools with child event streams", () =>
 		expect(result.content[0].text).toContain("NOT VERIFIED");
 		expect(tasks[0]).toBe("Task: do work"); expect(prompts[0]).toContain(REPORT_TOOL);
 		expect(fs.existsSync(promptPaths[0])).toBe(false);
+		expect(launches[0].args).not.toContain("--exclude-tools"); expect(launches[0].scope).toBeUndefined();
 	});
 	it("delivers bounded context and records real tool outcomes, not prose success", async () => {
 		scripts.push({ events: [...call("w", "write", { path: "test.ts" }), ...call("b", "bash", { command: "npm test" }, { content: [{ type: "text", text: "failed: test A" }] }, true), ...reportEvents(), say("Implemented")] });
@@ -119,6 +123,16 @@ describe("actual registered orchestration tools with child event streams", () =>
 		expect(tasks[1]).toContain("partial"); expect(r.details.results[0].delivery.observed.fileWrites).toEqual(["before.ts"]);
 		expect(r.details.results[0].delivery.declaration.status).toBe("complete");
 	});
+	it("reuses the same restricted policy and guard extension after retry", async () => {
+		scripts.push({ events: [say("partial", "Subagent stuck in a tool-call loop: read")], code: 1 }, { events: [say("done")] });
+		await execute("subagent", { agent: "test-worker", task: "x", write_scope: [{ path: "reference.md", kind: "file" }] });
+		expect(launches).toHaveLength(2); expect(launches[1].scope).toBe(launches[0].scope);
+		for (const launch of launches) {
+			expect(launch.args).toContain("--no-mcp");
+			expect(launch.args.some(a => a.endsWith("/scoped-mutations.ts"))).toBe(true);
+			expect(launch.args[launch.args.indexOf("--tools") + 1]).not.toMatch(/(?:^|,)write(?:,|$)/);
+		}
+	});
 	it("does not treat a cancellation with exit zero as completion", async () => {
 		const controller = new AbortController();
 		scripts.push({ events: [say("partial")], after: () => controller.abort() });
@@ -131,10 +145,73 @@ describe("actual registered orchestration tools with child event streams", () =>
 		const r = await execute("loop", { agent: "test-worker", task: "x" }, controller.signal);
 		expect(r.isError).toBe(true); expect(spawned).not.toHaveBeenCalled();
 	});
-	it("schemas expose optional context fields without write_scope promises", () => {
+	it("launches scoped workers without original mutators, shell or subdelegation", async () => {
+		registerAgent({ name: "full-worker", description: "", tools: ["read", "edit", "write", "bash", "safe_bash", "subagent", "unknown_custom"], model: "test/model", thinking: "low", systemPrompt: "Use bash", filePath: "" });
+		scripts.push({ events: [...call("e", "scoped_edit", { path: "reference.md", edits: [{ oldText: "a", newText: "b" }] }), ...reportEvents(), say("done")] });
+		const r = await execute("subagent", { agent: "full-worker", task: "edit", write_scope: [{ path: "reference.md", kind: "file" }] });
+		const args = launches[0].args;
+		expect(args[args.indexOf("--tools") + 1].split(",")).toEqual(["read", "scoped_edit", "scoped_write", REPORT_TOOL]);
+		expect(args[args.indexOf("--exclude-tools") + 1]).toContain("mcp__*"); expect(args).toContain("--no-mcp");
+		expect(args.some(a => a.endsWith("/scoped-mutations.ts"))).toBe(true);
+		expect(args.some(a => a.endsWith("/safe-bash.ts"))).toBe(false);
+		expect(JSON.parse(launches[0].scope!).roots[0].path).toBe(fs.realpathSync(path.join(root, "reference.md")));
+		expect(prompts[0]).toContain("coordinator must run builds/tests");
+		const d = r.details.results[0].delivery;
+		expect(d.restriction.disabledTools).toContain("unknown_custom"); expect(d.observed.fileWrites).toEqual(["reference.md"]);
+		expect(r.details.results[0].progress.recentTools[0].editSucceeded).toBe(true);
+		expect(r.content[0].text).toContain("Restricted write scope");
+	});
+	it("an empty scope removes even protected mutators", async () => {
+		scripts.push({ events: [say("read only")] });
+		await execute("subagent", { agent: "test-worker", task: "x", write_scope: [] });
+		const a = launches[0].args;
+		expect(a[a.indexOf("--tools") + 1]).toBe(`read,${REPORT_TOOL}`);
+		expect(JSON.parse(launches[0].scope!).roots).toEqual([]);
+	});
+	it("rejects invalid later pipeline scopes before any spawn", async () => {
+		await expect(execute("pipeline", { steps: [{ agent: "test-worker", task: "x" }, { agent: "test-worker", task: "y", write_scope: [{ path: "missing", kind: "directory" }] }] })).rejects.toThrow();
+		expect(spawned).not.toHaveBeenCalled();
+	});
+	it("keeps per-step scopes separate and never grants writes to a readonly judge", async () => {
+		registerAgent({ name: "readonly-judge", description: "", tools: ["read"], model: "test/model", thinking: "low", systemPrompt: "", filePath: "" });
+		scripts.push({ events: [say("one")] }, { events: [say("two")] });
+		await execute("pipeline", { steps: [{ agent: "test-worker", task: "x", write_scope: [] }, { agent: "test-worker", task: "y", write_scope: [{ path: "reference.md", kind: "file" }] }] });
+		expect(JSON.parse(launches[0].scope!).roots).toEqual([]); expect(JSON.parse(launches[1].scope!).roots).toHaveLength(1);
+		scripts.push({ events: [say("implementation")] }, { events: [say("YES")] });
+		await execute("loop", { agent: "test-worker", task: "x", write_scope: [{ path: "reference.md", kind: "file" }], judge: { agent: "readonly-judge", criteria: "correct" } });
+		const a = launches[3].args;
+		expect(a[a.indexOf("--tools") + 1]).toBe(`read,${REPORT_TOOL}`);
+		expect(launches[2].scope).toBe(launches[3].scope);
+	});
+	it("pins a later step's canonical root against symlink substitution by an earlier step", async () => {
+		const allowed = path.join(root, "allowed"), other = path.join(root, "other");
+		fs.mkdirSync(allowed); fs.mkdirSync(other);
+		scripts.push({ events: [say("first")], after: () => { fs.renameSync(allowed, path.join(root, "moved")); fs.symlinkSync(other, allowed); } });
+		const r = await execute("pipeline", { steps: [{ agent: "test-worker", task: "first" }, { agent: "test-worker", task: "second", write_scope: [{ path: allowed, kind: "directory" }] }] });
+		expect(r.isError).toBe(true); expect(spawned).toHaveBeenCalledTimes(1);
+		expect(r.details.pipelineResult.steps).toHaveLength(2);
+	});
+	it("inherits ambient scope even when a nested request omits the field", async () => {
+		const previous = process.env[WRITE_SCOPE_ENV];
+		try {
+			process.env[WRITE_SCOPE_ENV] = JSON.stringify(resolveWriteScope([], root));
+			scripts.push({ events: [say("done")] });
+			await execute("subagent", { agent: "test-worker", task: "x" });
+			expect(JSON.parse(launches[0].scope!).roots).toEqual([]);
+			await expect(execute("subagent", { agent: "test-worker", task: "x", write_scope: [{ path: root, kind: "directory" }] })).rejects.toThrow(/widen/);
+			expect(spawned).toHaveBeenCalledTimes(1);
+		} finally { if (previous === undefined) delete process.env[WRITE_SCOPE_ENV]; else process.env[WRITE_SCOPE_ENV] = previous; }
+	});
+	it("rejects null scope before Pi optional-field coercion could erase it", () => {
+		for (const name of ["subagent", "loop"]) expect(() => tools.get(name).prepareArguments({ write_scope: null })).toThrow(/write_scope/);
+		expect(() => tools.get("pipeline").prepareArguments({ steps: [{ write_scope: null }] })).toThrow(/write_scope/);
+		expect(tools.get("subagent").prepareArguments({ write_scope: [] })).toEqual({ write_scope: [] });
+	});
+	it("schemas expose optional context and an explicitly restricted write_scope", () => {
 		for (const schema of [tools.get("subagent").parameters, tools.get("loop").parameters, tools.get("pipeline").parameters.properties.steps.items]) {
 			expect(schema.properties.context_files).toBeDefined(); expect(schema.properties.constraints.description).toContain("NOT an enforced sandbox");
-			expect(schema.required).not.toContain("acceptance"); expect(schema.properties.write_scope).toBeUndefined();
+			expect(schema.required).not.toContain("acceptance"); expect(schema.required).not.toContain("write_scope");
+			expect(schema.properties.write_scope.description).toContain("Disables shell");
 		}
 	});
 });

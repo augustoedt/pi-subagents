@@ -7,6 +7,7 @@
  * re-invocations collapse (true positives preserved).
  */
 import * as crypto from "node:crypto";
+import { normalizeMutationTool } from "./tool-names";
 
 /**
  * Header injected by the loop tool when accumulating prior iteration context
@@ -68,7 +69,7 @@ export function extractCycleSignature(toolName: string, args: Record<string, unk
     const cap = (s: string, max: number = MAX_CYCLE_SIG_COMPONENT) =>
         s.length > max ? s.slice(0, max) : s;
 
-    switch (toolName) {
+    switch (normalizeMutationTool(toolName)) {
         case "bash":
         case "safe_bash": {
             const cmd = cap(flatten(String(args.command || "")));

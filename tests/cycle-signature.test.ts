@@ -200,6 +200,15 @@ describe("extractCycleSignature", () => {
         });
     });
 
+    describe("protected mutation names", () => {
+        it("normalizes scoped mutation signatures to legacy signatures", () => {
+            expect(extractCycleSignature("scoped_edit", { path: "f.ts", newText: "new" }))
+                .toBe(extractCycleSignature("edit", { path: "f.ts", newText: "new" }));
+            expect(extractCycleSignature("scoped_write", { path: "f.ts", content: "new" }))
+                .toBe(extractCycleSignature("write", { path: "f.ts", content: "new" }));
+        });
+    });
+
     describe("edit", () => {
         it("produces different signatures for same path with different body", () => {
             const sig1 = extractCycleSignature("edit", { path: "src/index.ts", newText: "const a = 1;" });

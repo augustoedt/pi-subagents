@@ -1,5 +1,9 @@
 # Desenvolver e carregar o subagent local
 
+Verificado em 2026-11-03: suíte e smoke do SDK instalado sem requisições a
+modelos; posteriormente recarga e smoke com worker real em fixture aprovados.
+Dados persistidos de `/se` conferidos; interação visual ainda não verificada.
+
 ## Premissas
 
 Checkout `~/Projects/Agents/pi-subagents`, branch `feat/better-subagent`, criada
@@ -32,6 +36,22 @@ console.log('Host Pi loader: OK; no model requests');
 JS
 ```
 
+4. Exercitar ferramentas protegidas e falhas de carga com o SDK instalado:
+
+```bash
+PI_SDK_ROOT=/caminho/da/instalacao/@earendil-works/pi-coding-agent \
+  node scripts/smoke-write-scope.mjs
+```
+
+O script usa sessões em memória, turnos sintéticos e fixtures temporárias.
+Verifica escrita/edição permitidas, bloqueio fora do escopo, escopo vazio,
+proteção ausente/inválida e indisponibilidade de mutadores originais/custom/MCP,
+inclusive via `ctx.executeTool`. Deve terminar com quatro cenários `PASS` e
+61 probes; não chama modelos, não modifica settings e limpa suas fixtures.
+Requer runtime com `ctx.executeTool` e `refreshContext`; não instalar/atualizar
+SDK automaticamente se a dependência local for antiga. `PI_SDK_ROOT` seleciona
+explicitamente a instalação que roda a sessão.
+
 O caminho interno do loader pode mudar entre versões do Pi. Isso é smoke de
 carregamento, não uma chamada real de modelo, revisão humana ou teste visual
 interativo. Os testes de orquestração usam eventos/processos simulados.
@@ -55,8 +75,8 @@ por:
 Não adicionar ambas as fontes: isso pode carregar duas cópias da extensão.
 Preservar todos os demais pacotes, provedores e preferências.
 3. Após a sessão ficar ociosa, executar `/reload` ou abrir uma nova sessão.
-4. Conferir que a ferramenta `subagent` oferece `context_files`, `acceptance`
-   e `constraints`. Se autorizado a gastar uma chamada, testar um scout
+4. Conferir que `subagent`, cada passo de `pipeline` e `loop` oferecem
+   `write_scope`, além de `context_files`, `acceptance` e `constraints`. Se autorizado a gastar uma chamada, testar um scout
    somente leitura e conferir `Delivery v1`, sem confundir declaração com
    comprovação. A ferramenta `subagent_report` é carregada somente nos filhos,
    não como ferramenta pública adicional do coordenador.
@@ -79,8 +99,14 @@ apagar resultados ou resetar mudanças locais.
   provedor ou registro dinâmico de uma ferramenta.
 - `not_reported` não significa entrega aceita. `acceptance: not_verified` é
   intencional; o coordenador ainda deve conferir o trabalho e as verificações.
-- `constraints` não impõe sandbox nem escopo de escrita. Esses mecanismos,
-  locks compartilhados e sessões retomáveis são recortes posteriores.
+- Probes de bloqueio esperados podem produzir `observed.incomplete: true`:
+  o coletor marca qualquer mutação falha conservadoramente. Conferir a sentinela,
+  escritas observadas e metadados das edições; não inferir sucesso pela declaração.
+- `constraints` não impõe escopo. `write_scope` controla mutações pelas ferramentas,
+  sem shell/subdelegação; builds/testes ficam no coordenador. Não é isolamento OS,
+  confinamento de leitura, lock compartilhado nem pinagem de identidade/inode.
+- Escopo ausente preserva o perfil; `[]` nega escritas. Diretórios de escopo já
+  devem existir antes do pipeline; `PI_SUBAGENT_WRITE_SCOPE` não pode vir de envExtra.
 - Alertas de background pertencem à outra extensão; este pacote não os corrige.
 
 Estado/evidência atual: [checkpoint](../checkpoints/project-state.md).

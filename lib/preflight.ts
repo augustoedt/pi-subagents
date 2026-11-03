@@ -59,6 +59,9 @@ export function preflightAgent(
 
 /** Validate supported runtime config fields without rejecting future fields. */
 export function validateRuntimeConfig(config: ExtensionConfig): void {
+	if (config.envExtra && Object.prototype.hasOwnProperty.call(config.envExtra, "PI_SUBAGENT_WRITE_SCOPE")) {
+		throw new Error("Invalid config field envExtra.PI_SUBAGENT_WRITE_SCOPE: use the explicit write_scope task parameter, not environment overrides");
+	}
 	const positiveIntegers: (keyof ExtensionConfig)[] = ["maxConcurrency", "maxSubagentDepth"];
 	for (const field of positiveIntegers) {
 		const value = config[field];

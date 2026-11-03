@@ -1,4 +1,5 @@
 import type { SavedEdit } from "./types";
+import { normalizeMutationTool } from "./tool-names";
 
 export function editPreviewNotice(diff: string): string | undefined {
     if (diff.includes("… per-edit safety limit reached")) return "Limite de segurança: parte do diff desta edição não foi guardada.";
@@ -43,7 +44,7 @@ export function collectAgentEdits(result: unknown, parents: string[] = []): Suba
     for (const tool of tools) {
         const call = tool as ToolCall | null;
         if (!call) continue;
-        if (call.tool === "edit" && call.editSucceeded) {
+        if (normalizeMutationTool(call.tool ?? "") === "edit" && call.editSucceeded) {
             const diff = typeof call.editFullDiff === "string" && call.editFullDiff
                 ? call.editFullDiff : call.editDiff;
             if (typeof diff === "string" && diff) {

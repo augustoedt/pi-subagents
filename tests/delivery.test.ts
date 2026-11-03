@@ -51,6 +51,13 @@ describe("observed evidence", () => {
 		expect(c.finish("completed").observed.fileWrites).toEqual(["e.ts", "w.ts"]);
 		expect(c.finish("completed").declaration?.claimed_files).toEqual(["a.ts"]);
 	});
+	it("records successful scoped mutations and excludes failed scoped edits", () => {
+		const c = new DeliveryCollector();
+		for (const [id, tool, fail] of [["se", "scoped_edit", false], ["sw", "scoped_write", false], ["bad", "scoped_edit", true]] as const) {
+			c.start(id, tool, { path: `${id}.ts` }); c.end(id, tool, {}, fail);
+		}
+		expect(c.finish("completed").observed.fileWrites).toEqual(["se.ts", "sw.ts"]);
+	});
 	it("ignores unsolicited or mismatched completion events", () => {
 		const c = new DeliveryCollector(); c.end("x", "write", {}, false);
 		c.start("a", "read", { path: "a.ts" }); c.end("a", "write", {}, false);

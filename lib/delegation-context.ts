@@ -2,7 +2,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { WriteScopeEntry } from "./write-scope";
+
 export interface DelegationContext {
+	write_scope?: WriteScopeEntry[];
 	context_files?: string[];
 	acceptance?: string[];
 	constraints?: string[];

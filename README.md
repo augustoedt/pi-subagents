@@ -148,11 +148,57 @@ fields; a loop passes them to its runner and judge. Context files are checked
 when the corresponding execution starts, so an earlier step may create one.
 
 `constraints` are prompt instructions, **not enforced write scopes or locks**.
-There is no `write_scope`, shared-resource scheduler, sandbox, or resumable
-worker session in this slice. Cwd, concrete model/tier resolution, declared
+Use `write_scope` below for enforced tool-level write boundaries. There is no
+shared-resource scheduler, OS sandbox, or resumable worker session in this slice.
+Cwd, concrete model/tier resolution, declared
 tool mappings/files, and supported configuration value types are checked
 before spawn. Provider availability, credentials and dynamic tool registration
 are not proven by this preflight.
+
+### Controlled write scope
+
+The coordinator chooses the smallest scope allowed by the user's authorization:
+
+```json
+{
+  "agent": "worker",
+  "task": "Add login tests; report checks for the coordinator to run",
+  "write_scope": [{ "path": "tests/auth", "kind": "directory" }]
+}
+```
+
+- Available on `subagent`, each pipeline step, and `loop` (runner and judge).
+  Omitted preserves the original profile; `[]` denies all writes. Explicit
+  `null` is rejected rather than coerced into an absent permission field.
+- At most 20 entries: nonblank paths up to 2000 characters, relative to cwd
+  or absolute. No globs, `@`, `~/`, or file URLs in **scope declarations**.
+- A `file` scope permits exactly that file; a new file requires an existing
+  parent. A `directory` scope must already exist and permits descendants,
+  including new subdirectories. Filesystem roots and `.git` are forbidden.
+- Only already-declared `edit`/`write` capabilities are replaced by
+  `scoped_edit`/`scoped_write`; readonly profiles never gain write access.
+  Local `read`/`grep`/`find`/`ls` remain available if declared; reporting is added.
+- Shell (`bash`/`safe_bash`), code execution, network/custom tools, MCP and
+  nested delegation are unavailable. **The coordinator runs builds/tests.**
+  Disabled tools and canonical roots are disclosed in the prompt and delivery.
+- Original mutators are excluded; protected tools have distinct names.
+  A failed guard-extension load does not restore unrestricted `edit`/`write`.
+  Retries retain the policy; inherited scope cannot widen. `envExtra` cannot
+  set the reserved `PI_SUBAGENT_WRITE_SCOPE` variable.
+
+Checks reject symlink escapes, dangling links, special files and multi-linked
+files. Roots are pinned to **canonical pathnames, not original directory inode
+identities**: recreating a directory at the same authorized pathname does not
+widen scope. Pipeline roots are resolved before the first step, so a preceding
+step cannot create a directory used as a new scope root in that pipeline.
+
+This is tool-boundary enforcement, **not an OS sandbox**, read confinement,
+filesystem snapshot or resource lock. Trusted extension/guard code, external
+processes and cross-process TOCTOU races are not isolated. Do not delegate edits
+to the trusted runtime itself and expect self-protection; the coordinator must
+validate such changes before another execution/reload. Workers requiring
+more access must report the blocker; the coordinator decides whether a new
+scope is already authorized or needs user approval.
 
 ## Output
 
@@ -170,7 +216,7 @@ receive text (no new `outputSchema` conversion).
 Acceptance stays `not_verified`: a zero child exit, a successful shell tool, or
 a judge's YES is not proof that tests/acceptance passed. The coordinator must
 inspect evidence and missing checks. Successful direct `edit`/`write` events
-and `bash`/`safe_bash` outcomes are recorded independently of the declaration;
+(including their `scoped_*` counterparts) and `bash`/`safe_bash` outcomes are recorded independently of the declaration;
 this is neither a full git diff nor an inventory of shell/descendant writes.
 Only actual tool-provided log paths are preserved. No logs or exit codes are
 invented from the agent's final answer.
@@ -192,7 +238,7 @@ Two levels, toggled with `ctrl+o`:
 
 In interactive Pi, `/se` lists the **ten most recent executions** of `subagent`, `pipeline`, or `loop` on the active session branch, including read-only agents such as `scout` and `researcher`. Select an execution to read its saved textual result; when it has successful `edit` calls, choose between the result and per-call diffs. Edits from nested agents show their author path. Use ↑/↓ to select, Enter to open, and Esc to return. In a result or diff, ↑/↓ scroll by line and Shift+↑/↓ by page. Very long textual results show an explicit warning after the first 128,000 characters; the saved result is unchanged. `ctrl+o` keeps a short inline preview; `/se` stores a larger diff per call (up to 500 lines or 32 KB), with a warning if its per-edit limit was reached.
 
-The live tool log remains limited to 50 calls. When older calls are evicted, `/se` retains up to 100 of their successful edits, capped at 512 KB per agent execution; if the archive overflows, the run shows an omission count. Failed runs remain browsable and failed edit attempts are counted, but only successful calls have diffs. Results saved by older versions may lack evicted edits, and older pipeline/loop results may lack all edits; `/se` flags this uncertainty. The explorer reads only the active branch of the current session, including when it is reopened. The ten-execution limit is a deliberate approximation, not a measurement of the terminal's scrollback buffer. It does not show `write` calls, reconstruct file contents, or use cumulative `git diff`.
+The live tool log remains limited to 50 calls. When older calls are evicted, `/se` retains up to 100 of their successful edits, capped at 512 KB per agent execution; if the archive overflows, the run shows an omission count. Failed runs remain browsable and failed edit attempts are counted, but only successful calls have diffs. Results saved by older versions may lack evicted edits, and older pipeline/loop results may lack all edits; `/se` flags this uncertainty. The explorer reads only the active branch of the current session, including when it is reopened. The ten-execution limit is a deliberate approximation, not a measurement of the terminal's scrollback buffer. Protected `scoped_edit` calls follow the same diff path. It does not show `write`/`scoped_write` diffs, reconstruct file contents, or use cumulative `git diff`.
 
 ## Registering Agents from Other Extensions
 
