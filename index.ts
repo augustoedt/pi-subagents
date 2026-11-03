@@ -15,7 +15,7 @@ import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
 import { configureSafeBash } from "./tools/safe-bash.js";
 
-import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
+import type { AgentConfig, AgentUsage, PipelineStep, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
 import { buildSubagentErrorContent, buildPipelineErrorContent, buildLoopErrorContent } from "./lib/error-helpers";
@@ -28,6 +28,15 @@ import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from ".
 import { DIFF_TRUNCATED_MARKER, INLINE_TRUNCATED_MARKER, fullEditDiff, previewEditDiff } from "./lib/tool-edit-diff";
 import { collectAgentEdits, collectAgentHealth, editPreviewNotice, listSubagentRuns, moveEditPreview, type SubagentEdit, type SubagentRun } from "./lib/subagent-edits";
 import { EditArchive } from "./lib/edit-archive";
+import { preflightAgent, validateRuntimeConfig } from "./lib/preflight";
+import { prepareDelegationTask, type DelegationContext } from "./lib/delegation-context";
+import { DeliveryCollector, deliveryText, REPORT_TOOL, REPORT_INSTRUCTIONS, type Delivery } from "./lib/delivery";
+
+const delegationProperties = () => ({
+	context_files: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20, description: "Existing readable reference files relative to cwd (or absolute). Paths only, no auto-injection of contents; no globs." })),
+	acceptance: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20, description: "Explicit acceptance criteria. Not automatically verified; the coordinator must inspect evidence." })),
+	constraints: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20, description: "Task restrictions and exclusions. Prompt instructions, NOT an enforced sandbox or file lock." })),
+});
 
 interface ToolEvent {
 	tool: string;
@@ -81,6 +90,7 @@ interface AgentProgress {
 }
 
 interface AgentResult {
+	delivery?: Delivery;
 	agent: string;
 	task: string;
 	output: string;
@@ -467,35 +477,29 @@ async function buildPiArgs(
 		throw new Error(depthResult.error!);
 	}
 
+	const prepared = preflightAgent(cwd, agent, BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
+	const reportExtension = path.join(TOOLS_DIR, "subagent-report.ts");
+	fs.accessSync(reportExtension, fs.constants.R_OK);
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
 	// Write system prompt to temp file
 	const promptPath = path.join(tempDir, `${agent.name}.md`);
 	await withFileMutationQueue(promptPath, async () => {
-		await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${REPORT_INSTRUCTIONS}`, { encoding: "utf-8", mode: 0o600 });
 	});
 
 	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session", "--no-skills"];
 
 	// Separate builtin tools from custom tools. Both kinds share the same
 	// --tools allowlist in pi; --no-tools would disable extension tools too.
-	const allowlist: string[] = [];
-	const extensionPaths = new Set<string>();
+	const allowlist = [...prepared.tools, REPORT_TOOL];
+	const extensionPaths = new Set([...prepared.extensionPaths, reportExtension]);
 
 	// The nan-builders extension registers the "nan" provider.
 	// Child processes need it to use nan models.
 	const NAN_BUILDERS_EXT = path.join(EXT_BASE, "nan-builders.ts");
 	if (fs.existsSync(NAN_BUILDERS_EXT)) {
 		extensionPaths.add(NAN_BUILDERS_EXT);
-	}
-
-	for (const tool of agent.tools) {
-		if (BUILTIN_TOOLS.has(tool)) {
-			allowlist.push(tool);
-		} else if (CUSTOM_TOOL_EXTENSIONS[tool]) {
-			allowlist.push(tool);
-			extensionPaths.add(CUSTOM_TOOL_EXTENSIONS[tool]);
-		}
 	}
 
 	// Use --no-extensions then add only what we need
@@ -615,13 +619,15 @@ async function runSubagent(
 	cwd: string,
 	signal: AbortSignal | undefined,
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"], finalExitCode?: number) => void,
+	context?: DelegationContext,
 ): Promise<AgentResult> {
 	// Resolve `$tier` / `inherit` once, here, so every downstream consumer —
 	// spawn args, result metadata, the TUI — sees the same concrete model.
 	const agent = resolveAgentForDispatch(rawAgent);
-	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
-	const command = args[0];
-	const spawnArgs = args.slice(1);
+	cwd = preflightAgent(cwd, agent, BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS).cwd;
+	task = prepareDelegationTask(task, context, cwd);
+	signal?.throwIfAborted();
+	const evidence = new DeliveryCollector();
 
 	const result: AgentResult = {
 		agent: agent.name,
@@ -657,7 +663,10 @@ async function runSubagent(
 	let priorHistoryIncomplete = false;
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-		const isRetry = attempt > 1;
+		// Each retry needs a fresh prompt/temp directory (the prior one is removed).
+		const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
+		const command = args[0];
+		const spawnArgs = args.slice(1);
 		const fullDiffs = new Map<string, string>();
 		const archive = new EditArchive();
 		let failedEdits = 0;
@@ -750,6 +759,7 @@ async function runSubagent(
 					pauseIdle();
 					progress.toolCount++;
 					const toolArgs = (evt.args || {}) as Record<string, unknown>;
+					evidence.start(evt.toolCallId, evt.toolName, toolArgs);
 					const fullDiff = evt.toolName === "edit" ? fullEditDiff(toolArgs) : undefined;
 					if (fullDiff && evt.toolCallId) fullDiffs.set(evt.toolCallId, fullDiff);
 					const preview = evt.toolName === "edit" ? previewEditDiff(toolArgs) : undefined;
@@ -821,6 +831,7 @@ async function runSubagent(
 				}
 
 				if (evt.type === "tool_execution_end") {
+					evidence.end(evt.toolCallId, evt.toolName, evt.result, evt.isError);
 					if (evt.toolName === "edit" && evt.isError) failedEdits++;
 					const hit = evt.toolCallId
 						? progress.recentTools.find((t) => t.toolCallId === evt.toolCallId)
@@ -944,6 +955,7 @@ async function runSubagent(
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		} catch {}
 
+		if (signal?.aborted && !progress.error) progress.error = "Subagent cancelled";
 		result.exitCode = exitCode;
 		progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
 		progress.durationMs = Date.now() - startTime;
@@ -968,7 +980,8 @@ async function runSubagent(
 		// Check if this was a loop error eligible for retry
 		const isLoopError = progress.error?.startsWith(LOOP_ERROR_PREFIX);
 
-		if (isLoopError && attempt < MAX_ATTEMPTS) {
+		if (isLoopError && attempt < MAX_ATTEMPTS && !signal?.aborted) {
+			evidence.retry();
 			retainedEdits.addAll(archive.entries());
 			retainedEdits.addAll(collectAgentEdits({ agent: agent.name, progress: { recentTools: progress.recentTools.map(call =>
 				call.editSucceeded && call.toolCallId ? { ...call, editFullDiff: fullDiffs.get(call.toolCallId) } : call) } }));
@@ -1006,6 +1019,7 @@ async function runSubagent(
 		progress.omittedEdits = retainedEdits.omitted;
 		progress.failedEdits = priorFailedEdits + failedEdits + evictedChildFailures;
 		progress.historyIncomplete = priorHistoryIncomplete || evictedHistoryIncomplete;
+		result.delivery = evidence.finish(signal?.aborted ? "cancelled" : progress.status === "completed" ? "completed" : "failed");
 		// Success or non-loop failure — return result
 		return result;
 	}
@@ -1232,10 +1246,24 @@ function renderAgentProgress(
 	return c;
 }
 
+function dispatchFailure(agent: AgentConfig, task: string, error: unknown): AgentResult {
+	const message = error instanceof Error ? error.message : String(error);
+	return { agent: agent.name, task, output: message, exitCode: 1, usage: zeroUsage(),
+		delivery: new DeliveryCollector().finish("failed"),
+		progress: { agent: agent.name, task, status: "failed", recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "", error: message } };
+}
+
+function deliveryContent(result: AgentResult): string {
+	const prose = result.exitCode !== 0 || result.progress.error ? buildSubagentErrorContent(result) : result.output || "(no output)";
+	const text = deliveryText(result.delivery) + "\n" + prose;
+	const truncated = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+	return truncated.content + (truncated.truncated ? "\n[Delivery/output truncated; bounded structured evidence remains in result details.]" : "");
+}
+
 // ── Pipeline Execution ────────────────────────────────────────────────
 
 async function runPipeline(
-	steps: Array<{ agent: string; task: string; connector?: string }>,
+	steps: PipelineStep[],
 	cwd: string,
 	signal: AbortSignal | undefined,
 	onUpdate?: (stepIndex: number, progress: AgentProgress, usage: AgentUsage) => void,
@@ -1246,7 +1274,7 @@ async function runPipeline(
 	const startTime = Date.now();
 
 	for (let i = 0; i < steps.length; i++) {
-		if (signal?.aborted) break;
+		if (signal?.aborted) return { steps: results, finalOutput: "Pipeline cancelled", error: "Pipeline cancelled", stoppedAt: i, totalUsage, totalDurationMs: Date.now() - startTime };
 
 		const step = steps[i];
 		const agent = agents.find((a) => a.name === step.agent);
@@ -1276,11 +1304,11 @@ async function runPipeline(
 		const result = await semaphore.run(() =>
 			runSubagent(agent, taskWithContext, cwd, signal, (progress, usage) => {
 				onUpdate?.(i, progress, usage);
-			}),
-		);
+			}, step),
+		).catch(error => dispatchFailure(agent, taskWithContext, error));
 
 		const stepResult: PipelineStepResult = {
-			agent: step.agent, task: step.task, output: result.output,
+			agent: step.agent, task: step.task, output: result.output, delivery: result.delivery,
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - stepStart,
 			edits: collectAgentEdits(result),
@@ -1288,7 +1316,7 @@ async function runPipeline(
 		};
 		results.push(stepResult);
 		totalUsage = accumulateUsage(totalUsage, result.usage);
-		previousOutput = result.output;
+		previousOutput = deliveryContent(result);
 
 		// Stop on error — surface the failing step's error as finalOutput (the pipeline
 		// tool returns finalOutput as content, so the main LLM sees the actual failure,
@@ -1319,6 +1347,7 @@ async function runLoop(
 	cwd: string,
 	signal: AbortSignal | undefined,
 	onUpdate?: (iteration: number, progress: AgentProgress, usage: AgentUsage) => void,
+	context?: DelegationContext,
 ): Promise<LoopResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) throw new Error(`Unknown agent: ${agentName}`);
@@ -1330,7 +1359,7 @@ async function runLoop(
 	const startTime = Date.now();
 
 	for (let i = 0; i < maxIterations; i++) {
-		if (signal?.aborted) break;
+		if (signal?.aborted) return { iterations, finalOutput: "Loop cancelled", stoppedBecause: "error", totalUsage, totalDurationMs: Date.now() - startTime };
 
 		// Build task with accumulated context
 		let fullTask = task;
@@ -1355,11 +1384,11 @@ async function runLoop(
 		const result = await semaphore.run(() =>
 			runSubagent(agent, fullTask, cwd, signal, (progress, usage) => {
 				onUpdate?.(i, progress, usage);
-			}),
-		);
+			}, context),
+		).catch(error => dispatchFailure(agent, fullTask, error));
 
 		const iterResult: LoopIterationResult = {
-			iteration: i + 1, output: result.output,
+			iteration: i + 1, output: result.output, delivery: result.delivery,
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - iterStart,
 			edits: collectAgentEdits(result),
@@ -1371,10 +1400,10 @@ async function runLoop(
 		if (judge && result.exitCode === 0 && !result.progress.error) {
 			const judgeAgent = agents.find((a) => a.name === judge.agent);
 			if (judgeAgent) {
-				const judgePrompt = `Evaluate this output against the criteria below. Respond with YES if satisfied, or NO with specific feedback.\n\nCriteria: ${judge.criteria}\n\nOutput to evaluate:\n${result.output}`;
+				const judgePrompt = `Evaluate this output against the criteria below. Respond with YES if satisfied, or NO with specific feedback.\n\nCriteria: ${judge.criteria}\n\nOutput and observed evidence to evaluate:\n${deliveryContent(result)}`;
 				const judgeResult = await semaphore.run(() =>
-					runSubagent(judgeAgent, judgePrompt, cwd, signal),
-				);
+					runSubagent(judgeAgent, judgePrompt, cwd, signal, undefined, context),
+				).catch(error => dispatchFailure(judgeAgent, judgePrompt, error));
 				totalUsage = accumulateUsage(totalUsage, judgeResult.usage);
 				iterResult.edits?.push(...collectAgentEdits(judgeResult));
 				const judgeHealth = collectAgentHealth(judgeResult);
@@ -1382,7 +1411,12 @@ async function runLoop(
 				iterResult.failedEdits = (iterResult.failedEdits ?? 0) + judgeHealth.failedEdits;
 				iterResult.historyIncomplete ||= judgeHealth.historyIncomplete;
 
-				// Parse judge verdict
+				iterResult.judgeDelivery = judgeResult.delivery;
+				if (judgeResult.exitCode !== 0 || judgeResult.progress.error) {
+					iterations.push(iterResult);
+					return { iterations, finalOutput: deliveryContent(judgeResult), stoppedBecause: "error", totalUsage, totalDurationMs: Date.now() - startTime };
+				}
+				// A judge's YES is a judgment, not an observed passing test.
 				const satisfied = parseJudgeVerdict(judgeResult.output);
 
 				iterResult.judgeVerdict = { satisfied, response: judgeResult.output };
@@ -1391,7 +1425,7 @@ async function runLoop(
 					iterations.push(iterResult);
 					stoppedBecause = "judge_satisfied";
 					return {
-						iterations, finalOutput: result.output,
+						iterations, finalOutput: deliveryContent(result),
 						stoppedBecause, totalUsage, totalDurationMs: Date.now() - startTime,
 					};
 				}
@@ -1399,7 +1433,7 @@ async function runLoop(
 		}
 
 		iterations.push(iterResult);
-		priorOutputs.push(result.output);
+		priorOutputs.push(deliveryContent(result));
 
 		if (result.exitCode !== 0 || result.progress.error) {
 			stoppedBecause = "error";
@@ -1582,12 +1616,13 @@ function renderLoopResult(
 
 export default function (pi: ExtensionAPI) {
 	extensionConfig = loadConfig();
+	validateRuntimeConfig(extensionConfig);
 	semaphore = new Semaphore(extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
 
 	// Wire up safe-bash config from ExtensionConfig
 	configureSafeBash({
-		exttraDangerousPatterns: extensionConfig.extraDangerousPatterns,
+		extraDangerousPatterns: extensionConfig.extraDangerousPatterns,
 		safeCommands: extensionConfig.safeCommands,
 	});
 
@@ -1747,12 +1782,14 @@ export default function (pi: ExtensionAPI) {
 			"Parallel tool calls are your primary parallelism mechanism — put multiple independent read/fetch/search calls in one function_calls block. Don't use subagents to parallelize simple I/O.",
 			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), read-only code/security review (reviewer), or isolated code changes (worker)",
 			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
-			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
+			"Subagents have NO context from the current conversation — supply task plus optional context_files, acceptance and constraints. These fields grant no extra permissions and constraints are not an enforced sandbox.",
+			"For subagent, pipeline and loop, distinguish process completion, agent declarations and observed tool evidence. A zero exit or a judge YES does not prove tests or acceptance passed. Inspect missing checks, failed commands and incomplete evidence.",
 			"When a subagent returns an error, read it carefully. For transient failures (timeout, API/network), retry once with the same task plus 'Previous attempt failed with: {error}'. For structural failures (wrong approach, missing context), simplify the task or switch agents. If it persists after retry, report to the user with the specific error.",
 		],
 		parameters: Type.Object({
 			agent: Type.String({ description: "Name of the agent to invoke" }),
 			task: Type.String({ description: "Task description" }),
+			...delegationProperties(),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		}),
 
@@ -1796,14 +1833,12 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: "(running...)" }],
 						details: { results: [liveResult] },
 					});
-				}),
+				}, params),
 			);
 
 			result.contextWindow = contextWindow;
 			const isError = result.exitCode !== 0 || !!result.progress.error;
-			const contentText = isError
-				? buildSubagentErrorContent(result)
-				: (result.output || "(no output)");
+			const contentText = deliveryContent(result);
 			return {
 				content: [{ type: "text", text: contentText }],
 				details: { results: [result] },
@@ -1907,6 +1942,7 @@ export default function (pi: ExtensionAPI) {
 				Type.Object({
 					agent: Type.String({ description: "Agent name for this step" }),
 					task: Type.String({ description: "Task description. Use {previous} to reference the prior step's output." }),
+					...delegationProperties(),
 					connector: Type.Optional(Type.String({ description: "Override agent's default connector template for this step. Format: \"## Header\\n\\n{output}\"" })),
 				}),
 				{ minItems: 2, maxItems: 5, description: "Sequential steps (2–5). Each step's agent output feeds into the next step's task via {previous}." },
@@ -1929,6 +1965,9 @@ export default function (pi: ExtensionAPI) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				throw new Error(`Unknown agent in pipeline: ${missing}. Available agents: ${available}`);
 			}
+
+			// Check every agent's prerequisites before the first step can mutate files.
+			for (const name of agentNames) preflightAgent(cwd, resolveAgentForDispatch(agents.find(a => a.name === name)!), BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
 
 			const liveResult: Details = {
 				pipelineResult: {
@@ -2038,7 +2077,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name to run in the loop" }),
 			task: Type.String({ description: "Task description for each iteration" }),
-			max_iterations: Type.Optional(Type.Number({ minimum: 2, maximum: 5, default: 3, description: "Maximum number of iterations (2–5, default 3)" })),
+			...delegationProperties(),
+			max_iterations: Type.Optional(Type.Integer({ minimum: 2, maximum: 5, default: 3, description: "Maximum number of iterations (2–5, default 3)" })),
 			judge: Type.Optional(Type.Object({
 				agent: Type.String({ description: "Judge agent name" }),
 				criteria: Type.String({ description: "Quality criteria. Judge responds YES if satisfied, NO otherwise." }),
@@ -2059,6 +2099,8 @@ export default function (pi: ExtensionAPI) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				throw new Error(`Unknown agent in loop: ${missing}. Available agents: ${available}`);
 			}
+
+			for (const name of agentNames) preflightAgent(cwd, resolveAgentForDispatch(agents.find(a => a.name === name)!), BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
 
 			const liveResult: Details = {
 				loopResult: {
@@ -2086,6 +2128,7 @@ export default function (pi: ExtensionAPI) {
 						details: liveResult,
 					});
 				},
+				params,
 			);
 
 			const isError = result.stoppedBecause === "error";

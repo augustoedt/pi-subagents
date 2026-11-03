@@ -19,7 +19,7 @@ pi install @rohaquinlop/pi-subagents
 
 ## Dependencies
 
-`safe_bash` ships in this repo (`tools/safe-bash.ts`). `web_search` and `web_fetch` do not — `researcher` and `worker` depend on them. Grab those two extensions from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) (`extensions/web-search/`, `extensions/web-fetch/`) and drop them into `~/.pi/agent/extensions/`. Without them the affected agents will launch with an empty tool allowlist and silently do nothing useful.
+`safe_bash` ships in this repo (`tools/safe-bash.ts`). `web_search` and `web_fetch` do not — `researcher` and `worker` depend on them. Grab those two extensions from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) (`extensions/web-search/`, `extensions/web-fetch/`) and drop them into `~/.pi/agent/extensions/`. A dispatch now fails explicitly before spawning if any declared tool lacks a mapping or its extension file is missing/unreadable. This checks mapping/files, not whether an arbitrary extension successfully registers its tool at runtime.
 
 ## Usage
 
@@ -32,7 +32,7 @@ One tool call = one subagent:
 
 To fan out, emit multiple `subagent` tool calls in the same assistant turn — pi runs them in parallel automatically. A per-process semaphore caps simultaneous subagents at `maxConcurrency` (default 4); calls past the cap wait their turn.
 
-Each subagent runs as an isolated `pi` process with no inherited context — all context must be in the task description. The `reviewer` has no edit, write, or shell tools; provide paths and review criteria in the task. It inherits the parent session's model.
+Each subagent runs as an isolated `pi` process with no inherited conversation — supply context in `task` or the optional fields below. Process isolation is not filesystem isolation or a sandbox. The `reviewer` has no edit, write, or shell tools; provide paths and review criteria in the task. It inherits the parent session's model.
 
 For a security review:
 ```json
@@ -125,11 +125,63 @@ A tier may point at another tier, or at `inherit`. Cycles are detected and
 reported rather than followed. An undefined tier fails the dispatch with the
 agent named — it never falls back to some default model.
 
+## Delegation contract (local `feat/better-subagent`)
+
+Existing `agent`, `task`, and `cwd` calls remain valid. Three optional arrays
+(maximum 20 nonblank strings of 2000 characters each) add explicit context:
+
+```json
+{
+  "agent": "worker",
+  "task": "Add login tests",
+  "context_files": ["src/auth/login.ts"],
+  "acceptance": ["Cover invalid password and expired session"],
+  "constraints": ["Do not change production code", "Do not commit"]
+}
+```
+
+`context_files` are existing readable files, relative to the child cwd or
+absolute (`@` and `~/` file references supported). They are passed as canonical
+paths, **not automatically read/injected**. File contents are task data, not
+instructions overriding the delegation. Each pipeline step accepts these
+fields; a loop passes them to its runner and judge. Context files are checked
+when the corresponding execution starts, so an earlier step may create one.
+
+`constraints` are prompt instructions, **not enforced write scopes or locks**.
+There is no `write_scope`, shared-resource scheduler, sandbox, or resumable
+worker session in this slice. Cwd, concrete model/tier resolution, declared
+tool mappings/files, and supported configuration value types are checked
+before spawn. Provider availability, credentials and dynamic tool registration
+are not proven by this preflight.
+
 ## Output
 
-Subagents return text only — there's no file handoff. If the parent needs artifacts, instruct the subagent to `write` them and return the path.
+The normal textual answer remains available. Each child also receives a
+read-only reporting tool, `subagent_report`, to declare its status, summary,
+claimed files, unexecuted checks, assumptions, and blockers. A missing report
+is explicitly `not_reported`; no JSON is inferred from arbitrary prose.
 
-Large outputs (>`DEFAULT_MAX_BYTES`) are head-truncated before being returned to the parent.
+`details.results[].delivery`, pipeline step `delivery`, and loop iteration
+`delivery`/`judgeDelivery` keep typed v1 metadata. Model-facing text includes a
+bounded summary/evidence before the answer. Existing codemode callers still
+receive text (no new `outputSchema` conversion).
+
+**Process completion, agent declaration and observed tool outcomes are separate.**
+Acceptance stays `not_verified`: a zero child exit, a successful shell tool, or
+a judge's YES is not proof that tests/acceptance passed. The coordinator must
+inspect evidence and missing checks. Successful direct `edit`/`write` events
+and `bash`/`safe_bash` outcomes are recorded independently of the declaration;
+this is neither a full git diff nor an inventory of shell/descendant writes.
+Only actual tool-provided log paths are preserved. No logs or exit codes are
+invented from the agent's final answer.
+
+Evidence retains at most 20 paths and 20 commands (1000-character command/output
+excerpts); missing events, omissions and truncation are disclosed. A report is
+limited to 16 KB JSON. Evidence survives retry; later work invalidates a stale
+report. Large model-facing outputs are head-truncated at Pi's normal limits.
+If artifacts are needed, request their creation explicitly and inspect them.
+
+Development state and local install/rollback: [docs/README.md](docs/README.md).
 
 ## UI
 

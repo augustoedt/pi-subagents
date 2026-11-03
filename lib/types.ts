@@ -1,3 +1,6 @@
+import type { DelegationContext } from "./delegation-context";
+import type { Delivery } from "./delivery";
+
 export interface AgentConfig {
     name: string;
     description: string;
@@ -19,7 +22,7 @@ export interface AgentUsage {
     turns: number;
 }
 
-export interface PipelineStep {
+export interface PipelineStep extends DelegationContext {
     agent: string;
     task: string;  // May contain {previous} placeholder
     connector?: string;  // Override agent's default connector for this step
@@ -32,6 +35,7 @@ export interface SavedEdit {
 }
 
 export interface PipelineStepResult {
+    delivery?: Delivery;
     agent: string;
     task: string;
     output: string;
@@ -55,6 +59,8 @@ export interface PipelineResult {
 }
 
 export interface LoopIterationResult {
+    delivery?: Delivery;
+    judgeDelivery?: Delivery;
     iteration: number;
     output: string;
     exitCode: number;
