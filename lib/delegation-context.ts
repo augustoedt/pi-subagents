@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { WriteScopeEntry } from "./write-scope";
 
 export interface DelegationContext {
+	resources?: string[];
 	write_scope?: WriteScopeEntry[];
 	context_files?: string[];
 	acceptance?: string[];

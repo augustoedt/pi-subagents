@@ -69,7 +69,7 @@ export function validateRuntimeConfig(config: ExtensionConfig): void {
 			throw new Error(`Invalid config field ${field}: expected a positive safe integer`);
 		}
 	}
-	const nonnegativeIntegers: (keyof ExtensionConfig)[] = ["subagentTimeoutMs", "subagentIdleTimeoutMs"];
+	const nonnegativeIntegers: (keyof ExtensionConfig)[] = ["subagentTimeoutMs", "subagentIdleTimeoutMs", "queueTimeoutMs", "maxQueueDepth"];
 	for (const field of nonnegativeIntegers) {
 		const value = config[field];
 		if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 0)) {

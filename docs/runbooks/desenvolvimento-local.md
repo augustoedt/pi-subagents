@@ -1,8 +1,9 @@
 # Desenvolver e carregar o subagent local
 
-Verificado em 2026-11-03: suíte e smoke do SDK instalado sem requisições a
-modelos; posteriormente recarga e smoke com worker real em fixture aprovados.
-Dados persistidos de `/se` conferidos; interação visual ainda não verificada.
+Verificado em 2026-11-03: 492 testes; smokes do SDK e guardas; continuidade
+com worker real em dois turnos no launcher novo via processo isolado. Usuário
+confirmou recarga e teste funcional dos recortes 3 + 4. Dados persistidos de `/se`
+conferidos no recorte 2; inspeção visual independente não realizada, não bloqueante.
 
 ## Premissas
 
@@ -52,6 +53,21 @@ Requer runtime com `ctx.executeTool` e `refreshContext`; não instalar/atualizar
 SDK automaticamente se a dependência local for antiga. `PI_SDK_ROOT` seleciona
 explicitamente a instalação que roda a sessão.
 
+5. Validar continuidade com o SDK instalado, sem LLM:
+
+```bash
+PI_SDK_ROOT=/caminho/da/instalacao/@earendil-works/pi-coding-agent \
+  node scripts/smoke-continuity.mjs
+```
+
+Confere mesmo transcript/ID/contexto restaurado, modelo/tools explícitos,
+redução permanente de escopo, permissões 0600 e limpeza. Para smoke com worker
+real, **quando autorizado a consumir modelo**, acrescentar `--live`: são dois
+turnos de worker, podendo envolver várias requisições por turno. O segundo
+recupera um nonce do primeiro sem o nonce no prompt e sem ler arquivos. Usa o
+perfil `worker` atual e seu provedor; não instalar/alterar credenciais por falha.
+O script isola o launcher novo; não recarrega a sessão interativa do operador.
+
 O caminho interno do loader pode mudar entre versões do Pi. Isso é smoke de
 carregamento, não uma chamada real de modelo, revisão humana ou teste visual
 interativo. Os testes de orquestração usam eventos/processos simulados.
@@ -75,8 +91,8 @@ por:
 Não adicionar ambas as fontes: isso pode carregar duas cópias da extensão.
 Preservar todos os demais pacotes, provedores e preferências.
 3. Após a sessão ficar ociosa, executar `/reload` ou abrir uma nova sessão.
-4. Conferir que `subagent`, cada passo de `pipeline` e `loop` oferecem
-   `write_scope`, além de `context_files`, `acceptance` e `constraints`. Se autorizado a gastar uma chamada, testar um scout
+4. Conferir `resources` e `write_scope` nos três tools (por passo no pipeline),
+   e `continuity` somente em `subagent`, além dos campos de contexto. Se autorizado a gastar uma chamada, testar um scout
    somente leitura e conferir `Delivery v1`, sem confundir declaração com
    comprovação. A ferramenta `subagent_report` é carregada somente nos filhos,
    não como ferramenta pública adicional do coordenador.
@@ -107,6 +123,21 @@ apagar resultados ou resetar mudanças locais.
   confinamento de leitura, lock compartilhado nem pinagem de identidade/inode.
 - Escopo ausente preserva o perfil; `[]` nega escritas. Diretórios de escopo já
   devem existir antes do pipeline; `PI_SUBAGENT_WRITE_SCOPE` não pode vir de envExtra.
+- Recursos só coordenam irmãos na instância atual. Escritores sem escopo ficam
+  serializados; readonly não ganha snapshot consistente. Espera tem duração/motivo
+  próprios, separados do timeout do filho; maxQueueDepth=64 e queueTimeoutMs=0.
+- Workers retomáveis exigem escopo, agente/modelo/perfil/cwd compatíveis e histórico
+  válido. `worker_busy` significa outro turno pendente/ativo; aguardar seu resultado,
+  não criar chamadas concorrentes para o mesmo ID. Escopo reduzido não reabre.
+- Reload/troca de sessão/restart invalida IDs. Não importar JSONL de outro worker
+  nem tratar ID ausente como criação silenciosa. Limites: 16 workers, 20 turnos,
+  16 MiB de transcript conferidos entre turnos; sem eviction/truncamento automático.
+- Históricos temporários ficam sob `os.tmpdir()/pi-worker-sessions-*`, fora do
+  workspace e do picker normal. Encerramento normal limpa somente artefatos próprios
+  após o filho terminar. Crash pode deixar resíduos: antes de remover manualmente,
+  identificar o diretório da execução encerrada e confirmar ausência de processo
+  usando-o. Nunca varrer/apagar o prefixo inteiro nem seguir links simbólicos;
+  não há takeover ou retomada pós-crash. Conteúdo pode ser sensível.
 - Alertas de background pertencem à outra extensão; este pacote não os corrige.
 
 Estado/evidência atual: [checkpoint](../checkpoints/project-state.md).

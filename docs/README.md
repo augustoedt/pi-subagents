@@ -2,9 +2,9 @@
 
 ## Como navegar
 
-Ler [estado atual](checkpoints/project-state.md). Não há plano ativo de código;
-recorte 2 concluído, recarregado, exercitado com worker real e commitado com
-autorização. Publicação/push não autorizados.
+Ler [estado atual](checkpoints/project-state.md). Recortes 1 a 4 concluídos,
+commitados e recarregados; usuário confirmou teste funcional dos recortes 3 + 4.
+Não há plano ativo de implementação. Publicação/push não autorizados.
 O [README principal](../README.md) é a referência pública do contrato.
 
 | Antes de… | Leia |
@@ -27,13 +27,15 @@ Um único checkpoint para retomar trabalho:
 
 ## plans/
 
-Reservada a planos vivos. Nenhum recorte adicional aprovado para implementação.
+Reservada a planos vivos. Nenhum novo recorte aprovado; a utilidade da evolução
+do histórico/explorer será reavaliada antes de planejar implementação.
 
 ## archive/
 
 Planos concluídos, preservados como histórico, não como roteiro ativo:
-[primeiro recorte](archive/better-subagent.md) e
-[escopo de escrita — recorte 2](archive/write-scope.md).
+[primeiro recorte](archive/better-subagent.md),
+[escopo de escrita — recorte 2](archive/write-scope.md) e
+[coordenação e continuidade — recortes 3 + 4](archive/coordenacao-e-continuidade.md).
 
 ## runbooks/
 

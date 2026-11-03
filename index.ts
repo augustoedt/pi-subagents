@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { SessionManager, getMarkdownTheme, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Container, Key, Markdown, SelectList, Spacer, Text, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
@@ -32,10 +32,14 @@ import { preflightAgent, validateRuntimeConfig } from "./lib/preflight";
 import { prepareDelegationTask, type DelegationContext } from "./lib/delegation-context";
 import { DeliveryCollector, deliveryText, REPORT_TOOL, REPORT_INSTRUCTIONS, type Delivery } from "./lib/delivery";
 import { normalizeMutationTool } from "./lib/tool-names";
-import { planRestrictedAgent, prepareScopeArguments, restrictedNotice, type RestrictedPlan } from "./lib/restricted-mode";
+import { planRestrictedAgent, restrictedNotice, type RestrictedPlan } from "./lib/restricted-mode";
 import { WRITE_SCOPE_ENV, parseWriteScopeEnv } from "./lib/write-scope";
+import { ResourceCoordinator, createResourceClaims, type ResourceClaims } from "./lib/resource-coordinator";
+import { WorkerSessions, type WorkerLease, type WorkerSessionInfo } from "./lib/worker-sessions";
+import { parseContinuity, agentFingerprint, prepareOrchestrationArguments } from "./lib/continuity";
 
 const delegationProperties = () => ({
+	resources: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 20, description: "Exclusive named resources in this Pi instance. Overlapping write_scope paths are also coordinated. Does not grant tools or filesystem permissions." })),
 	write_scope: Type.Optional(Type.Array(Type.Object({
 		path: Type.String({ minLength: 1, maxLength: 2000, description: "Exact file or existing directory, relative to cwd or absolute; no globs, @, ~/, or file URLs." }),
 		kind: Type.Union([Type.Literal("file"), Type.Literal("directory")]),
@@ -74,6 +78,8 @@ interface ToolEvent {
 }
 
 interface AgentProgress {
+	queueWaitMs?: number;
+	waitReason?: string;
 	agent: string;
 	status: "pending" | "running" | "completed" | "failed";
 	task: string;
@@ -97,6 +103,7 @@ interface AgentProgress {
 }
 
 interface AgentResult {
+	worker_session?: WorkerSessionInfo;
 	delivery?: Delivery;
 	agent: string;
 	task: string;
@@ -282,7 +289,7 @@ const MODEL_EXTENSIONS: ModelExtension[] = buildModelExtensions();
 // ── Agent Discovery & Registration ────────────────────────────────────
 
 let agents: AgentConfig[] = [];
-let semaphore: Semaphore;
+let runtime: DispatchRuntime;
 
 // Read once at module load. If we're a child subagent process whose parent
 // pinned an allowlist, we silently ignore any agent (built-in OR registered
@@ -471,12 +478,12 @@ function resolveAgentForDispatch(agent: AgentConfig): AgentConfig {
 	return { ...agent, model: resolution.model };
 }
 
-interface DispatchPlan extends RestrictedPlan { cwd: string }
+interface DispatchPlan extends RestrictedPlan { cwd: string; claims: ResourceClaims }
 
 function prepareDispatch(rawAgent: AgentConfig, cwd: string, context?: DelegationContext): DispatchPlan {
 	const plan = planRestrictedAgent(resolveAgentForDispatch(rawAgent), context?.write_scope, cwd, process.env[WRITE_SCOPE_ENV]);
 	const prepared = preflightAgent(cwd, plan.agent, BUILTIN_TOOLS, CUSTOM_TOOL_EXTENSIONS);
-	return { ...plan, cwd: prepared.cwd };
+	return { ...plan, cwd: prepared.cwd, claims: createResourceClaims(plan, context?.resources) };
 }
 
 async function buildPiArgs(
@@ -484,6 +491,7 @@ async function buildPiArgs(
 	task: string,
 	cwd: string,
 	plan: DispatchPlan,
+	worker?: WorkerLease,
 ): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv }> {
 	const piBin = resolvePiBinary();
 
@@ -508,7 +516,9 @@ async function buildPiArgs(
 		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${REPORT_INSTRUCTIONS}${restrictedNotice(plan)}`, { encoding: "utf-8", mode: 0o600 });
 	});
 
-	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session", "--no-skills"];
+	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-skills"];
+	if (worker) args.push("--session", worker.file, "--session-dir", worker.directory);
+	else args.push("--no-session");
 	if (plan.scope) args.push("--exclude-tools", plan.excludedTools.join(","), "--no-mcp");
 
 	// Separate builtin tools from custom tools. Both kinds share the same
@@ -548,7 +558,7 @@ async function buildPiArgs(
 		args.push("--extension", extPath);
 	}
 
-	args.push("--models", agent.model);
+	args.push(worker ? "--model" : "--models", agent.model);
 	args.push("--thinking", agent.thinking);
 	args.push("--append-system-prompt", promptPath);
 
@@ -647,6 +657,7 @@ async function runSubagent(
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"], finalExitCode?: number) => void,
 	context?: DelegationContext,
 	preparedPlan?: DispatchPlan,
+	worker?: WorkerLease,
 ): Promise<AgentResult> {
 	// Resolve `$tier` / `inherit` once, here, so every downstream consumer —
 	// spawn args, result metadata, the TUI — sees the same concrete model.
@@ -684,7 +695,8 @@ async function runSubagent(
 		onUpdate?.(progress, result.usage);
 	}, 150);
 
-	const MAX_ATTEMPTS = 2; // 1 initial attempt + 1 retry
+	const MAX_ATTEMPTS = worker ? 1 : 2; // Persistent turns require explicit retry.
+	let workerModelObserved = false;
 	const MAX_PARTIAL_CONTEXT = 4000;
 	const retainedEdits = new EditArchive();
 	let priorFailedEdits = 0;
@@ -692,7 +704,7 @@ async function runSubagent(
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		// Each retry needs a fresh prompt/temp directory (the prior one is removed).
-		const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd, plan);
+		const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd, plan, worker);
 		const command = args[0];
 		const spawnArgs = args.slice(1);
 		const fullDiffs = new Map<string, string>();
@@ -905,6 +917,14 @@ async function runSubagent(
 							progress.tokens = (u as { totalTokens?: number }).totalTokens
 								|| (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
 						}
+						if (worker) {
+							const actualModel = `${evt.message.provider}/${evt.message.model}`;
+							workerModelObserved = actualModel === agent.model;
+							if (!workerModelObserved) {
+								progress.error = `Worker model mismatch: expected ${agent.model}, observed ${actualModel}`;
+								proc.kill("SIGTERM");
+							}
+						}
 						if (evt.message.model) result.model = evt.message.model;
 						if (evt.message.errorMessage) progress.error = evt.message.errorMessage;
 
@@ -983,6 +1003,7 @@ async function runSubagent(
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		} catch {}
 
+		if (worker && !workerModelObserved && !progress.error) progress.error = "Worker did not report its pinned model";
 		if (signal?.aborted && !progress.error) progress.error = "Subagent cancelled";
 		result.exitCode = exitCode;
 		progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
@@ -1090,30 +1111,85 @@ function throttle<T extends (...args: any[]) => void>(fn: T, ms: number): T {
 
 // ── Parallel Execution with Concurrency Limit ─────────────────────────
 
-/**
- * Process-wide cap on simultaneous `runSubagent` calls. Each `execute()` of the
- * `subagent` tool is independent (pi runs LLM tool calls via `Promise.all`), so
- * we serialize at the `runSubagent` boundary. Per-process scope only — nested
- * subagent processes have their own semaphore, so the cap applies to direct
- * children, not the whole tree (which keeps things deadlock-free).
- */
-class Semaphore {
-	private inFlight = 0;
-	private readonly waiters: Array<() => void> = [];
-	constructor(private readonly max: number) {}
-	async run<T>(fn: () => Promise<T>): Promise<T> {
-		if (this.inFlight >= this.max) {
-			await new Promise<void>((r) => this.waiters.push(r));
-		}
-		this.inFlight++;
-		try {
-			return await fn();
-		} finally {
-			this.inFlight--;
-			const next = this.waiters.shift();
-			if (next) next();
-		}
+interface DispatchRuntime {
+	owner?: string;
+	coordinator: ResourceCoordinator;
+	workers: WorkerSessions;
+	abort: AbortController;
+	calls: Set<Promise<AgentResult>>;
+}
+function createRuntime(): DispatchRuntime {
+	return {
+		coordinator: new ResourceCoordinator({ maxConcurrency: extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
+			maxQueueDepth: extensionConfig.maxQueueDepth, queueTimeoutMs: extensionConfig.queueTimeoutMs }),
+		workers: new WorkerSessions({ headerFactory: (cwd, id) => ({ ...SessionManager.inMemory(cwd).getHeader(), id }) }),
+		abort: new AbortController(), calls: new Set(),
+	};
+}
+async function shutdownRuntime(state: DispatchRuntime): Promise<void> {
+	state.abort.abort();
+	state.coordinator.close("Parent session ended or reloaded");
+	state.workers.dispose(); // Active transcripts remain until the child closes.
+	await Promise.allSettled([...state.calls]);
+}
+async function runtimeFor(ctx: ExtensionContext): Promise<DispatchRuntime> {
+	const owner = ctx.sessionManager?.getSessionId();
+	const prior = runtime;
+	if (prior.abort.signal.aborted || (prior.owner && prior.owner !== owner)) {
+		await shutdownRuntime(prior);
+		if (runtime === prior) runtime = createRuntime();
 	}
+	runtime.owner = owner;
+	return runtime;
+}
+function dispatchSignal(state: DispatchRuntime, signal?: AbortSignal): AbortSignal {
+	return signal ? AbortSignal.any([signal, state.abort.signal]) : state.abort.signal;
+}
+async function dispatchAgent(
+	state: DispatchRuntime, agent: AgentConfig, task: string, plan: DispatchPlan, signal: AbortSignal,
+	onUpdate?: (progress: AgentProgress, usage: AgentUsage, exitCode?: number) => void,
+	context?: DelegationContext, worker?: WorkerLease,
+): Promise<AgentResult> {
+	const call = (async () => {
+		const queuedAt = Date.now();
+		let waitMs = 0, waitReason: string | undefined, began = false;
+		let result: AgentResult;
+		try {
+			result = await state.coordinator.run(plan.claims, signal, async elapsed => {
+				waitMs = elapsed;
+				signal.throwIfAborted();
+				if (worker) { worker.start(); began = true; }
+				return runSubagent(agent, task, plan.cwd, signal, (progress, usage, exitCode) => {
+					progress.queueWaitMs = waitMs; progress.waitReason = waitReason;
+					onUpdate?.(progress, usage, exitCode);
+				}, context, plan, worker);
+			}, reason => {
+				waitReason = reason;
+				onUpdate?.({ agent: agent.name, task, status: "pending", recentTools: [], toolCount: 0,
+					tokens: 0, durationMs: 0, lastMessage: `Waiting: ${reason}`, waitReason: reason, queueWaitMs: 0 }, zeroUsage());
+			});
+		} catch (error) {
+			result = dispatchFailure(agent, task, error);
+			if (!began) waitMs = Date.now() - queuedAt;
+		}
+		if (signal.aborted && result.delivery) result.delivery.process = "cancelled";
+		if (worker) {
+			try {
+				if (began) result.worker_session = worker.finish(signal.aborted ? "cancelled" : result.progress.status === "completed" ? "completed" : "failed");
+				else worker.cancelBeforeStart();
+			} catch (error) {
+				result.progress.warning = `Worker history cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
+		result.progress.queueWaitMs = waitMs; result.progress.waitReason = waitReason;
+		if (result.delivery) {
+			result.delivery.coordination = { scope: "process-local", waitMs, waitReason, claims: plan.claims };
+			if (plan.scope) result.delivery.restriction = { scope: plan.scope, disabledTools: plan.disabledTools };
+		}
+		return result;
+	})();
+	state.calls.add(call);
+	try { return await call; } finally { state.calls.delete(call); }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────
@@ -1284,7 +1360,8 @@ function dispatchFailure(agent: AgentConfig, task: string, error: unknown): Agen
 
 function deliveryContent(result: AgentResult): string {
 	const prose = result.exitCode !== 0 || result.progress.error ? buildSubagentErrorContent(result) : result.output || "(no output)";
-	const text = deliveryText(result.delivery) + "\n" + prose;
+	const identity = result.worker_session ? `[Worker session; per-turn evidence] ${JSON.stringify(result.worker_session)}\n` : "";
+	const text = identity + deliveryText(result.delivery) + "\n" + prose;
 	const truncated = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 	return truncated.content + (truncated.truncated ? "\n[Delivery/output truncated; bounded structured evidence remains in result details.]" : "");
 }
@@ -1292,6 +1369,7 @@ function deliveryContent(result: AgentResult): string {
 // ── Pipeline Execution ────────────────────────────────────────────────
 
 async function runPipeline(
+	state: DispatchRuntime,
 	steps: PipelineStep[],
 	cwd: string,
 	signal: AbortSignal | undefined,
@@ -1332,11 +1410,8 @@ async function runPipeline(
 		}
 
 		const stepStart = Date.now();
-		const result = await semaphore.run(() =>
-			runSubagent(agent, taskWithContext, cwd, signal, (progress, usage) => {
-				onUpdate?.(i, progress, usage);
-			}, step, plans[i]),
-		).catch(error => dispatchFailure(agent, taskWithContext, error));
+		const result = await dispatchAgent(state, agent, taskWithContext, plans[i], dispatchSignal(state, signal),
+			(progress, usage) => onUpdate?.(i, progress, usage), step);
 
 		const stepResult: PipelineStepResult = {
 			agent: step.agent, task: step.task, output: result.output, delivery: result.delivery,
@@ -1371,6 +1446,7 @@ async function runPipeline(
 // ── Loop Execution ─────────────────────────────────────────────────────
 
 async function runLoop(
+	state: DispatchRuntime,
 	agentName: string,
 	task: string,
 	maxIterations: number,
@@ -1414,11 +1490,8 @@ async function runLoop(
 		}
 
 		const iterStart = Date.now();
-		const result = await semaphore.run(() =>
-			runSubagent(agent, fullTask, cwd, signal, (progress, usage) => {
-				onUpdate?.(i, progress, usage);
-			}, context, runnerPlan),
-		).catch(error => dispatchFailure(agent, fullTask, error));
+		const result = await dispatchAgent(state, agent, fullTask, runnerPlan, dispatchSignal(state, signal),
+			(progress, usage) => onUpdate?.(i, progress, usage), context);
 
 		const iterResult: LoopIterationResult = {
 			iteration: i + 1, output: result.output, delivery: result.delivery,
@@ -1434,9 +1507,7 @@ async function runLoop(
 			const judgeAgent = agents.find((a) => a.name === judge.agent);
 			if (judgeAgent) {
 				const judgePrompt = `Evaluate this output against the criteria below. Respond with YES if satisfied, or NO with specific feedback.\n\nCriteria: ${judge.criteria}\n\nOutput and observed evidence to evaluate:\n${deliveryContent(result)}`;
-				const judgeResult = await semaphore.run(() =>
-					runSubagent(judgeAgent, judgePrompt, cwd, signal, undefined, context, judgePlan),
-				).catch(error => dispatchFailure(judgeAgent, judgePrompt, error));
+				const judgeResult = await dispatchAgent(state, judgeAgent, judgePrompt, judgePlan!, dispatchSignal(state, signal), undefined, context);
 				totalUsage = accumulateUsage(totalUsage, judgeResult.usage);
 				iterResult.edits?.push(...collectAgentEdits(judgeResult));
 				const judgeHealth = collectAgentHealth(judgeResult);
@@ -1650,7 +1721,10 @@ function renderLoopResult(
 export default function (pi: ExtensionAPI) {
 	extensionConfig = loadConfig();
 	validateRuntimeConfig(extensionConfig);
-	semaphore = new Semaphore(extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+	if (runtime) void shutdownRuntime(runtime);
+	runtime = createRuntime();
+	pi.on("session_start", async (_event, ctx) => { await runtimeFor(ctx); });
+	pi.on("session_shutdown", async () => { await shutdownRuntime(runtime); });
 	agents = loadAgents();
 
 	// Wire up safe-bash config from ExtensionConfig
@@ -1808,7 +1882,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		prepareArguments: prepareScopeArguments,
+		prepareArguments: args => prepareOrchestrationArguments(args, true),
 		description:
 			"Run a subagent to complete a task. Subagents have NO context from the current conversation — include all necessary context in the task description.",
 		promptSnippet: "Run subagents for delegated tasks",
@@ -1818,6 +1892,8 @@ export default function (pi: ExtensionAPI) {
 			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
 			"Subagents have NO context from the current conversation — supply task plus optional context_files, acceptance and constraints. These fields grant no extra permissions and constraints are not an enforced sandbox.",
 			"For subagent/pipeline/loop code changes, set write_scope to the smallest authorized files/directories when the worker does not need shell or subdelegation. In scoped mode those tools are unavailable: run builds/tests in the coordinator. Never widen scope beyond user authorization. This is not an OS sandbox.",
+			"Overlapping write_scope paths and named resources serialize within this Pi instance; independent claims run concurrently. Unscoped potential writers serialize conservatively. This does not coordinate other processes or provide a read snapshot.",
+			"Use continuity create only for a scoped worker that needs follow-up turns; resume using worker_session.id. Resumes inherit cwd/scope unless explicitly supplied, may narrow but never widen scope, and keep the same agent/model/profile. Busy workers reject simultaneous turns. Reload/restart invalidates IDs; no automatic retry for persistent turns.",
 			"For subagent, pipeline and loop, distinguish process completion, agent declarations and observed tool evidence. A zero exit or a judge YES does not prove tests or acceptance passed. Inspect missing checks, failed commands and incomplete evidence.",
 			"When a subagent returns an error, read it carefully. For transient failures (timeout, API/network), retry once with the same task plus 'Previous attempt failed with: {error}'. For structural failures (wrong approach, missing context), simplify the task or switch agents. If it persists after retry, report to the user with the specific error.",
 		],
@@ -1825,11 +1901,18 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.String({ description: "Name of the agent to invoke" }),
 			task: Type.String({ description: "Task description" }),
 			...delegationProperties(),
+			continuity: Type.Optional(Type.Union([
+				Type.Object({ mode: Type.Literal("create") }, { additionalProperties: false }),
+				Type.Object({ mode: Type.Literal("resume"), worker_id: Type.String({ maxLength: 36 }) }, { additionalProperties: false }),
+			], { description: "Opt-in worker history, scoped tools only. Create requires explicit write_scope; resume uses returned worker_id, inheriting or narrowing scope. Same parent session/instance only: reload/restart invalidates IDs. No automatic retry or simultaneous turns. Temporary private transcript writes are runtime metadata." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		}),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const state = await runtimeFor(ctx);
+			signal = dispatchSignal(state, signal);
 			const cwd = ctx.cwd;
+			prepareOrchestrationArguments(params, true);
 
 			if (!params.agent || !params.task) {
 				throw new Error("`subagent` requires both `agent` and `task`. To fan out work, emit multiple `subagent` tool calls in the same turn — they run in parallel.");
@@ -1845,6 +1928,23 @@ export default function (pi: ExtensionAPI) {
 			// /model since the last dispatch, and `inherit` should follow that.
 			sessionModelSpec = formatModelSpec(ctx.model) ?? sessionModelSpec;
 			const resolvedAgent = resolveAgentForDispatch(agent);
+			const continuity = parseContinuity(params.continuity);
+			let context: DelegationContext = params;
+			let targetCwd = params.cwd ?? cwd;
+			let worker: WorkerLease | undefined;
+			if (continuity?.mode === "resume") {
+				const prior = state.workers.getPolicy(continuity.worker_id, state.owner ?? "");
+				targetCwd = params.cwd ?? prior.cwd;
+				context = { ...params, write_scope: params.write_scope ?? prior.scope.roots };
+			}
+			if (continuity && (!state.owner || context.write_scope === undefined)) throw new Error("Worker continuity requires a parent session identity and explicit write_scope on creation");
+			const plan = prepareDispatch(agent, targetCwd, context);
+			prepareDelegationTask(params.task, context, plan.cwd); // Fail before allocating history.
+			if (continuity) {
+				const policy = { owner: state.owner!, agent: agent.name, fingerprint: agentFingerprint(resolvedAgent),
+					model: resolvedAgent.model!, thinking: resolvedAgent.thinking, cwd: plan.cwd, scope: plan.scope! };
+				worker = continuity.mode === "create" ? state.workers.create(policy) : state.workers.resume(continuity.worker_id, policy);
+			}
 
 			const [provider, modelId] = (resolvedAgent.model || "").split("/");
 			const contextWindow = provider && modelId ? ctx.modelRegistry.find(provider, modelId)?.contextWindow : undefined;
@@ -1859,8 +1959,7 @@ export default function (pi: ExtensionAPI) {
 				progress: { agent: params.agent, status: "running" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 			};
 
-			const result = await semaphore.run(() =>
-				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage, finalExitCode) => {
+			const result = await dispatchAgent(state, agent, params.task!, plan, signal, (progress, usage, finalExitCode) => {
 					liveResult.progress = progress;
 					liveResult.usage = { ...usage };
 					if (finalExitCode !== undefined) liveResult.exitCode = finalExitCode;
@@ -1868,8 +1967,7 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: "(running...)" }],
 						details: { results: [liveResult] },
 					});
-				}, params),
-			);
+				}, context, worker);
 
 			result.contextWindow = contextWindow;
 			const isError = result.exitCode !== 0 || !!result.progress.error;
@@ -1963,7 +2061,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pipeline",
 		label: "Pipeline",
-		prepareArguments: prepareScopeArguments,
+		prepareArguments: args => prepareOrchestrationArguments(args),
 		description:
 			"Run 2–5 agents in sequence. Each agent's output feeds as {previous} context into the next agent's task. Use for multi-stage workflows like scout → worker → reviewer.",
 		promptSnippet: "Run sequential multi-agent pipelines",
@@ -1987,6 +2085,9 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const state = await runtimeFor(ctx);
+			signal = dispatchSignal(state, signal);
+			prepareOrchestrationArguments(params);
 			const cwd = params.cwd ?? ctx.cwd;
 			sessionModelSpec = formatModelSpec(ctx.model) ?? sessionModelSpec;
 
@@ -2013,6 +2114,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await runPipeline(
+				state,
 				params.steps,
 				cwd,
 				signal,
@@ -2020,7 +2122,7 @@ export default function (pi: ExtensionAPI) {
 					const pResult = liveResult.pipelineResult!;
 					pResult.currentStep = stepIndex;
 					// Update live result with latest step progress
-					if (progress.status === "running") {
+					if (progress.status === "running" || progress.status === "pending") {
 						// Ensure step slot exists for live rendering
 						if (stepIndex === pResult.steps.length) {
 							pResult.steps.push({
@@ -2098,7 +2200,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "loop",
 		label: "Loop",
-		prepareArguments: prepareScopeArguments,
+		prepareArguments: args => prepareOrchestrationArguments(args),
 		description:
 			"Run the same agent 2–5 times, passing prior iteration outputs as context. Optionally use a judge agent to evaluate quality and stop early.",
 		promptSnippet: "Run iterative refinement loops with optional judge",
@@ -2121,6 +2223,9 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const state = await runtimeFor(ctx);
+			signal = dispatchSignal(state, signal);
+			prepareOrchestrationArguments(params);
 			const cwd = params.cwd ?? ctx.cwd;
 			sessionModelSpec = formatModelSpec(ctx.model) ?? sessionModelSpec;
 			const maxIterations = params.max_iterations ?? 3;
@@ -2146,6 +2251,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await runLoop(
+				state,
 				params.agent,
 				params.task,
 				maxIterations,

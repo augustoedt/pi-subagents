@@ -1,6 +1,7 @@
 import { normalizeMutationTool } from "./tool-names";
 import { restrictedNotice } from "./restricted-mode";
 import type { WriteScope } from "./write-scope";
+import type { ResourceClaims } from "./resource-coordinator";
 
 /** A delivery is an agent declaration plus bounded, independently observed tool events.
  * Neither a successful child exit nor a successful shell tool proves acceptance. */
@@ -25,6 +26,7 @@ export interface CommandEvidence {
 }
 
 export interface Delivery {
+	coordination?: { scope: "process-local"; waitMs: number; waitReason?: string; claims: ResourceClaims };
 	restriction?: { scope: WriteScope; disabledTools: string[] };
 	version: 1;
 	process: "completed" | "failed" | "cancelled";
@@ -150,6 +152,7 @@ export function deliveryText(delivery: Delivery | undefined): string {
 	const d = delivery.declaration;
 	const counts = delivery.observed.commands.reduce((a, c) => { a[c.outcome]++; return a; }, { succeeded: 0, failed: 0, unknown: 0 });
 	return `[Delivery v1] Process: ${delivery.process}; agent declaration: ${d?.status ?? "not_reported"}; acceptance: NOT VERIFIED.\n` +
+		(delivery.coordination ? `[Coordination: instance only] waited ${delivery.coordination.waitMs}ms; reason=${delivery.coordination.waitReason ?? "ready"}; global writer=${delivery.coordination.claims.globalWriter}; resources=${JSON.stringify(delivery.coordination.claims.names)}. No filesystem lock or read snapshot.\n` : "") +
 		(delivery.restriction ? restrictedNotice(delivery.restriction) : "") +
 		`Direct tool evidence: ${delivery.observed.fileWrites.length} file writes; commands ${counts.succeeded} succeeded / ${counts.failed} failed / ${counts.unknown} unknown. ` +
 		`Coverage: direct tools only, not a complete diff; omitted=${delivery.observed.omitted}; incomplete=${delivery.observed.incomplete}.\n` +

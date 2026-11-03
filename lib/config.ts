@@ -20,6 +20,8 @@ import * as path from "node:path";
 
 export interface ExtensionConfig {
 	maxConcurrency?: number;
+	maxQueueDepth?: number;          // waiting calls, default 64; 0 refuses waits.
+	queueTimeoutMs?: number;         // queue deadline, default 0 = disabled.
 	subagentTimeoutMs?: number;      // wall-clock, default 600000 (10 min). 0 = disabled.
 	subagentIdleTimeoutMs?: number;  // no-stdout watchdog, default 300000 (5 min). 0 = disabled.
 	maxSubagentDepth?: number;       // max nesting depth, default 8. Hard backstop against recursion loops.

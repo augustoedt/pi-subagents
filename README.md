@@ -30,7 +30,7 @@ One tool call = one subagent:
 { "agent": "scout", "task": "Find all auth-related files in src/" }
 ```
 
-To fan out, emit multiple `subagent` tool calls in the same assistant turn — pi runs them in parallel automatically. A per-process semaphore caps simultaneous subagents at `maxConcurrency` (default 4); calls past the cap wait their turn.
+To fan out, emit multiple `subagent` tool calls in the same assistant turn. The instance-local coordinator admits independent work concurrently up to `maxConcurrency` (default 4); overlapping write scopes or named resources wait. Unscoped potential writers serialize conservatively.
 
 Each subagent runs as an isolated `pi` process with no inherited conversation — supply context in `task` or the optional fields below. Process isolation is not filesystem isolation or a sandbox. The `reviewer` has no edit, write, or shell tools; provide paths and review criteria in the task. It inherits the parent session's model.
 
@@ -148,9 +148,9 @@ fields; a loop passes them to its runner and judge. Context files are checked
 when the corresponding execution starts, so an earlier step may create one.
 
 `constraints` are prompt instructions, **not enforced write scopes or locks**.
-Use `write_scope` below for enforced tool-level write boundaries. There is no
-shared-resource scheduler, OS sandbox, or resumable worker session in this slice.
-Cwd, concrete model/tier resolution, declared
+Use `write_scope` below for enforced tool-level write boundaries. Resource
+coordination and opt-in worker continuity are described below; neither is an OS
+sandbox or a cross-instance lock. Cwd, concrete model/tier resolution, declared
 tool mappings/files, and supported configuration value types are checked
 before spawn. Provider availability, credentials and dynamic tool registration
 are not proven by this preflight.
@@ -199,6 +199,76 @@ to the trusted runtime itself and expect self-protection; the coordinator must
 validate such changes before another execution/reload. Workers requiring
 more access must report the blocker; the coordinator decides whether a new
 scope is already authorized or needs user approval.
+
+### Resource coordination (instance-local)
+
+`resources?: string[]` is available on `subagent`, each pipeline step, and `loop`
+(runner and judge). Names are exclusive reservations, not permissions: at most
+20 nonblank names of 128 characters; the `__` prefix is reserved. Names and path
+comparisons are NFC-normalized and case-folded, which can conservatively serialize
+otherwise distinct paths on case-sensitive filesystems.
+
+- Effective writers automatically reserve exact files/subtrees from `write_scope`.
+- Unscoped shell/custom tools and other potential writers use a global writer
+  reservation. Proven read-only profiles do not reserve writes automatically.
+- Capacity and all resources are admitted together. Independent waiting work can
+  start without waiting for an unrelated busy resource; conflicting waiters keep
+  arrival order. No slot is consumed while waiting for resource availability.
+- `maxQueueDepth` defaults to 64; `queueTimeoutMs` defaults to 0 (no queue deadline).
+  Child execution timeouts remain separate. Queue cancellation never spawns a child.
+- Running reservations release after the child exits, even on cancellation/failure.
+  Pipeline steps and loop runner/judge turns release between executions.
+- Delivery metadata reports claims, wait duration and reason. This coordinates
+  direct sibling calls only, not another Pi, descendants, other extensions, external
+  commands or editors. It does not provide a consistent snapshot for reads.
+
+### Worker continuity (opt-in, subagent only)
+
+Create a scoped worker whose own history will be needed again:
+
+```json
+{
+  "agent": "worker",
+  "task": "Implement the first part; report checks for the coordinator",
+  "write_scope": [{ "path": "src/feature", "kind": "directory" }],
+  "continuity": { "mode": "create" }
+}
+```
+
+Continue using the `worker_session.id` returned in text/details:
+
+```json
+{
+  "agent": "worker",
+  "task": "Correct the edge case from your previous turn",
+  "continuity": { "mode": "resume", "worker_id": "<returned UUID>" }
+}
+```
+
+A new child process loads the same private transcript; this is not a live daemon.
+Omitted `continuity` retains the original ephemeral behavior. Creation requires
+explicit `write_scope` (including `[]`). Resume inherits omitted cwd/scope; explicit
+scope may narrow permanently but never widen. Agent/profile, concrete model,
+thinking and cwd remain pinned. Unknown IDs, incompatible policy, missing/corrupt
+history and concurrent turns fail explicitly. A busy worker rejects another turn
+rather than silently queuing it. The orchestrator does not automatically repeat
+persistent turns (including loop-detector retries); failed/cancelled turns require
+an explicit resume and valid history. Internal Pi/provider transport retries are
+not disabled by this feature.
+
+Ownership lasts only for the current parent session/instance. Reload, session
+replacement or restart invalidates IDs. Temporary directories are private (0700),
+JSONL files are precreated 0600, and only owned artifacts are cleaned after active
+children exit. Runtime transcript writes are administrative metadata **outside
+workspace write_scope**; they may contain code and tool outputs. A hard crash can
+leave private temporary residues; there is no automatic takeover or cross-process
+recovery. Never pass arbitrary session paths or import another session's ID.
+
+Limits: 16 workers per instance, 20 turns per worker, 16 MiB per transcript checked
+between turns (not an in-flight disk quota). No silent eviction or JSONL truncation.
+`worker_session` reports ID, turn, status, resumability and bounded prior-turn
+references; `Delivery v1` remains evidence for **one turn**, not cumulative approval.
+Pipeline/loop receive resource coordination but remain ephemeral in this version.
 
 ## Output
 
